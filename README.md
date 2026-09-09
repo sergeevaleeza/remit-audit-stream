@@ -21,8 +21,16 @@ needs the result to be auditable rather than fast.
   produces one row per visit date and provider.
 - **Fuzzy patient matching.** Handles the uppercase Medicare spelling, names
   truncated by Medicare (a long surname clipped to its first 13 characters),
-  trailing middle initials (`SMITH, JANE R` → `Smith, Jane`) and
-  Slavic/Armenian gendered surname endings (`Ivanova` / `Ivanov`).
+  trailing middle initials (`SMITH, JANE R` → `Smith, Jane`), generational
+  suffixes (`Marchetti Jr, Dean` matches `MARCHETTI, DEAN`) and Slavic/Armenian
+  gendered surname endings (`Ivanova` / `Ivanov`).
+- **New names written in the sheet's style.** A row the app appends stores
+  `Marchetti, Dean`, not Medicare's `MARCHETTI, DEAN`. Existing names are never
+  rewritten.
+- **Optional DX reference.** Upload `List_of_Patients_Mutual.xlsx` and the app
+  fills blank `DX` cells from it. Without it, `DX` is left blank as before.
+- **Audit trail.** Rows the app creates or fills are stamped with
+  `Processed On` and the `Remit Check/EFT #` that produced them.
 - **Only fills blank cells, never overwrites.** This is the core safety
   guarantee. A cell that already holds *any* value is left exactly as it was.
   Every write is re-checked against the live cell immediately before it happens.
@@ -68,7 +76,9 @@ and so are skipped automatically.
 | `Co-pay` | **sum of COINS** (the 4th dollar amount) across those lines |
 | `Comment` | doctor resolved from the PERF-PROV NPI |
 | `CPT Code` | E/M code first, then the add-on, joined with `/` (new rows only) |
-| `DX` | left blank on new rows |
+| `DX` | from the optional Mutual workbook, else left blank |
+| `Processed On` | today's date, on any row the app creates or fills |
+| `Remit Check/EFT #` | the `CHECK/EFT #` of the remit that produced the row |
 | `Co-pays Paid`, `Office` | never touched |
 
 `PROV-PD` is already net of the CO-45 write-off and CO-253 sequestration, so it
@@ -94,6 +104,47 @@ an `[npi_to_doctor]` table in Streamlit secrets when deployed. See
 | `1000000003` | Dr. C |
 
 An NPI outside this table leaves `Comment` blank and flags the visit for review.
+
+### DX reference (`List_of_Patients_Mutual.xlsx`)
+
+An **optional** third upload. Only the **`Active`** sheet is read, and it has
+**no header row** — data starts on row 1 and columns are read positionally:
+
+| Column | Meaning |
+|---|---|
+| A | Patient (`Lastname, Firstname`) |
+| B | DX |
+| E | attending doctor — **deliberately not read** |
+
+Names are matched with exactly the same normalisation used against the
+schedule, so suffixes, casing and Medicare truncation resolve consistently
+across all three files. The DX is then written:
+
+- **New rows** — `DX` is set from the lookup (previously always blank).
+- **Existing rows the app is already filling** — a **blank** `DX` is filled
+  too. Controlled by `FILL_DX_ON_EXISTING` in `remit/config.py`; set it to
+  `False` to restrict DX to new rows only.
+- A non-blank `DX` is never overwritten, and rows the app **skips** (already
+  paid) are never touched at all.
+
+Edge cases: a patient absent from the Mutual file leaves `DX` blank rather
+than guessing; a patient listed twice with different codes uses the first and
+flags the conflict in the preview; a low-confidence name match is flagged
+*Needs review* and leaves `DX` blank.
+
+### Audit columns
+
+The app maintains two columns of its own, created on first use in the first
+empty columns after `CPT Code` (L and M in the standard layout), with headers
+in row 2 matching the header row's formatting:
+
+- **`Processed On`** — the run date as `MM/DD/YYYY`.
+- **`Remit Check/EFT #`** — the `CHECK/EFT #` from the remittance header. If
+  more than one remit contributes to a row, the numbers are joined with `; `.
+
+These are the app's own columns, so unlike every other column they are
+refreshed on each row the app touches. Rows it skips or never touches are left
+unchanged.
 
 ---
 
@@ -140,11 +191,14 @@ specific invited viewers) can open it, rather than leaving it public.
 
 1. Upload `List_of_Patients_Schedule.xlsx`.
 2. Upload one or more remittance PDFs.
-3. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
+3. Optionally upload `List_of_Patients_Mutual.xlsx` to source the `DX` column.
+4. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
    (already paid) · W need review*.
-4. Work through the preview table. Untick anything you do not want applied.
-   Items flagged **Needs review** start unticked.
-5. Click **Confirm & generate file**, then **Download updated workbook**. The
+5. Work through the preview table. Untick anything you do not want applied.
+   Items flagged **Needs review** start unticked. The **DX (from Mutual)**
+   column shows what would go into a blank `DX` cell, and **Processed On** /
+   **Remit Check/EFT #** show the audit stamps.
+6. Click **Confirm & generate file**, then **Download updated workbook**. The
    file is named `List_of_Patients_Schedule_updated_YYYY-MM-DD.xlsx` so
    successive archived copies do not collide.
 
@@ -157,17 +211,23 @@ matching **patient name** and the same **parsed calendar date** in `Data`, then:
 
 | Situation | Action |
 |---|---|
-| Match found, `Payment` empty | **Fill existing row N** — writes only the blank cells among `Billed`, `Payment`, `Co-pay`, `Comment` |
+| Match found, `Payment` empty | **Fill existing row N** — writes only the blank cells among `Billed`, `Payment`, `Co-pay`, `Comment`, `DX` |
 | Match found, `Payment` holds any value | **Skip (already paid)** |
 | No match | **New row** appended after the last data row |
-| Low-confidence name, unknown NPI, or ambiguous multi-match | **Needs review** — never auto-applied |
+| Low-confidence name, unknown NPI, ambiguous multi-match, or ambiguous DX name | **Needs review** — never auto-applied |
 
 - **The dedup key is Patient + Data + CPT.** A payment is considered already
   recorded when the matched row has anything in `Payment`.
 - **`0.00` and `0` count as populated.** Only a truly empty cell is fillable.
   A formula such as `=23.52+18.92` also counts as a value.
 - **Never overwrite.** Existing `DX`, `CPT Code`, `Co-pays Paid`, `Office`,
-  `Comment` or any other prefilled value is left exactly as-is.
+  `Comment` or any other prefilled value is left exactly as-is. The one
+  deliberate exception is the app's own `Processed On` / `Remit Check/EFT #`
+  audit columns, which are refreshed on rows it touches this run.
+- **Names are compared, not rewritten.** Generational suffixes (`Jr`, `Sr`,
+  `II`–`V`) are stripped for comparison only, so `Marchetti Jr, Dean` matches
+  `MARCHETTI, DEAN` and gets filled instead of duplicated. The stored spelling of
+  an existing row is never changed; only newly appended names are title-cased.
 - **The `Billed` placeholder caveat.** `Billed` is frequently pre-filled with
   junk such as `2/32/26` or `No Billing`. Because of the never-overwrite rule
   that placeholder **stays in place** when a row is filled. The preview shows
@@ -212,8 +272,17 @@ repo, or before pushing any change to GitHub.
 - **Name truncation vs. typos.** A name that is a strict prefix of another is
   treated as a confident match, because that is exactly how Medicare truncates.
   A dropped trailing character therefore reads as truncation rather than as a
-  typo, and a suffix like `Smith Jr` matches `Smith`. Requiring an exact date
-  match is what keeps this safe in practice.
+  typo. Requiring an exact date match is what keeps this safe in practice — and
+  it applies to suffix matching too, so stripping `Jr` can never pull in a
+  different person on a different date.
+- **`Mac` surnames are not special-cased** when title-casing a new name.
+  `MCDONALD` becomes `McDonald`, but `MACDONALD` becomes `Macdonald`, because
+  `MacDonald` and `Macy`/`Machado` cannot be told apart without a name list.
+  Fix those few by hand, or extend `_title_word` in `remit/matching.py`.
+- **A duplicate row from an earlier run is not deleted.** If a previous version
+  appended an all-caps `MARCHETTI, DEAN` next to `Marchetti Jr, Dean`, the app now
+  matches the suffix row correctly but only *flags* the leftover duplicate in
+  the preview — removing it is a manual decision.
 - **Unknown NPIs** leave `Comment` blank and are flagged rather than guessed.
 - **Workbook repair.** Excel writes `<family val="18">`/`"34"` font attributes
   that openpyxl's schema rejects (it caps the value at 14). The real schedule

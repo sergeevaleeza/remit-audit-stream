@@ -16,7 +16,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 from rapidfuzz import fuzz
 
@@ -25,15 +25,27 @@ from .config import (
     ACTION_NEW,
     ACTION_REVIEW,
     ACTION_SKIP,
+    CHECK_EFT_JOINER,
     COL_BILLED,
     COL_COMMENT,
     COL_COPAY,
+    COL_DX,
     COL_PAYMENT,
+    DATE_FMT,
+    DX_AMBIGUOUS,
+    DX_CONFLICT,
+    DX_NO_FILE,
+    FILL_DX_ON_EXISTING,
     FILLABLE_COLUMNS,
+    GENERATIONAL_SUFFIX_TITLES,
+    GENERATIONAL_SUFFIXES,
     NAME_AUTO_MATCH_SCORE,
     NAME_REVIEW_MIN_SCORE,
 )
 from .pdf_parser import Visit, order_cpt_codes
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    from .mutual import DxLookup
 
 _WS_RE = re.compile(r"\s+")
 
@@ -99,11 +111,26 @@ def surname_key(value: str) -> str:
     return key
 
 
+def strip_generational_suffix(last_name: str) -> str:
+    """``"marchetti jr"`` -> ``"marchetti"``; ``"smith iii"`` -> ``"smith"``.
+
+    Applied to the surname *before* harmonisation, so a suffix cannot block
+    the Slavic/Armenian ending rules from firing (``Bystritskaya Jr`` has to
+    reduce the same way ``Bystritskaya`` does). Never strips the only token,
+    so a genuine surname of ``V`` survives.
+    """
+    parts = _normalize_token(last_name).split()
+    while len(parts) > 1 and parts[-1].rstrip(".") in GENERATIONAL_SUFFIXES:
+        parts.pop()
+    return " ".join(parts)
+
+
 def split_name(value: str) -> tuple[str, str]:
     """``"SMITH, JANE R"`` -> ``("smith", "jane")``.
 
-    Splits on the comma, drops a trailing single-letter middle initial and
-    harmonises the surname. Names without a comma are treated as surname-only.
+    Splits on the comma, drops a trailing single-letter middle initial, strips
+    any generational suffix and harmonises the surname. Names without a comma
+    are treated as surname-only.
     """
     text = _normalize_token(value)
     if not text:
@@ -118,7 +145,60 @@ def split_name(value: str) -> tuple[str, str]:
     if len(first_parts) > 1 and len(first_parts[-1].rstrip(".")) == 1:
         first_parts = first_parts[:-1]
 
-    return surname_key(last.strip()), " ".join(first_parts).strip()
+    return surname_key(strip_generational_suffix(last)), " ".join(first_parts).strip()
+
+
+# --- Title casing for names the app writes ---------------------------------
+
+def _title_word(word: str) -> str:
+    """Capitalise one hyphen-free, space-free word, keeping Mc/apostrophes."""
+    if not word:
+        return word
+    if "'" in word:
+        return "'".join(_title_word(part) for part in word.split("'"))
+    titled = word[0].upper() + word[1:].lower()
+    # McDonald, but not "Mc" alone. Mac- is deliberately left alone: MacDonald
+    # and Machado/Macy are indistinguishable without a name list.
+    if len(titled) > 3 and titled[:2] == "Mc":
+        titled = titled[:2] + titled[2].upper() + titled[3:]
+    return titled
+
+
+def _title_part(part: str) -> str:
+    """Title-case one side of the comma, token by token."""
+    tokens = []
+    for token in part.split():
+        stripped = token.rstrip(".")
+        trailing = token[len(stripped):]
+        suffix = GENERATIONAL_SUFFIX_TITLES.get(stripped.lower())
+        if suffix is not None:
+            tokens.append(suffix + trailing)
+        else:
+            tokens.append("-".join(_title_word(w) for w in token.split("-")))
+    return " ".join(tokens)
+
+
+def to_title_name(value: str) -> str:
+    """``"MARCHETTI, DEAN"`` -> ``"Marchetti, Dean"``, matching the sheet's style.
+
+    Preserves the ``Last, First`` shape, keeps single-letter middle initials
+    capitalised, renders generational suffixes the way the sheet writes them
+    (``Jr``/``Sr``, roman numerals uppercase), and handles hyphens,
+    apostrophes and ``Mc``. Used only for names the app *creates* -- an
+    existing name in the sheet is never rewritten.
+    """
+    if value is None:
+        return ""
+    text = _WS_RE.sub(" ", str(value).strip())
+    if not text:
+        return ""
+
+    if "," in text:
+        last, _, first = text.partition(",")
+        last_titled = _title_part(last.strip())
+        first_titled = _title_part(first.strip())
+        return f"{last_titled}, {first_titled}" if first_titled else last_titled
+    return _title_part(text)
 
 
 def _part_score(left: str, right: str, min_prefix: int) -> float:
@@ -243,9 +323,29 @@ class Change:
     review_reasons: list[str] = field(default_factory=list)
     accepted: bool = True
 
+    #: DX sourced from the optional Mutual workbook, and how it was resolved.
+    dx_value: str | None = None
+    dx_status: str = DX_NO_FILE
+    dx_note: str = ""
+
+    #: Audit stamps written to the app's own columns for any row it touches.
+    processed_on: str = ""
+    check_eft_display: str = ""
+
     @property
     def needs_review(self) -> bool:
         return self.action == ACTION_REVIEW
+
+    @property
+    def dx_display(self) -> str:
+        """The DX column of the preview table."""
+        if self.dx_status == DX_NO_FILE:
+            return ""
+        if self.dx_value and self.dx_note:
+            return f"{self.dx_value} ({self.dx_note})"
+        if self.dx_value:
+            return self.dx_value
+        return f"({self.dx_status})"
 
     @property
     def effective_action(self) -> str:
@@ -315,11 +415,13 @@ def _disambiguate(visit: Visit,
     return None
 
 
-def _fill_values(visit: Visit, row: ScheduleRow) -> dict[str, Any]:
+def _fill_values(visit: Visit, row: ScheduleRow,
+                 dx_value: str | None = None) -> dict[str, Any]:
     """Target cells that are currently blank, and what to put in them.
 
     Anything already holding a value -- including a junk ``Billed``
-    placeholder -- is left out of the result and so never overwritten.
+    placeholder or an existing ``DX`` -- is left out of the result and so
+    never overwritten.
     """
     proposed = {
         COL_BILLED: visit.billed_str,
@@ -333,14 +435,42 @@ def _fill_values(visit: Visit, row: ScheduleRow) -> dict[str, Any]:
         COL_COPAY: row.copay,
         COL_COMMENT: row.comment,
     }
-    return {
+    fills = {
         column: proposed[column]
         for column in FILLABLE_COLUMNS
         if proposed[column] not in (None, "") and is_blank(current[column])
     }
 
+    if FILL_DX_ON_EXISTING and dx_value and is_blank(row.dx):
+        fills[COL_DX] = dx_value
 
-def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
+    return fills
+
+
+def _dx_for(visit: Visit, dx_lookup: "DxLookup | None") -> tuple[str | None, str, str, str | None]:
+    """(dx value, status, preview note, review reason) for one visit."""
+    if dx_lookup is None:
+        return None, DX_NO_FILE, "", None
+
+    match = dx_lookup.find(visit.patient)
+
+    if match.status == DX_CONFLICT:
+        note = f"conflict: {', '.join(match.conflicting)}"
+        return match.dx, match.status, note, None
+
+    if match.status == DX_AMBIGUOUS:
+        reason = (
+            f"Ambiguous DX name match ({match.score:.0f}%): "
+            f"'{visit.patient}' vs Mutual '{match.matched_name}' - DX left blank"
+        )
+        return None, match.status, "", reason
+
+    return match.dx, match.status, "", None
+
+
+def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
+                dx_lookup: "DxLookup | None" = None,
+                today: date | None = None) -> Change:
     """Decide what, if anything, this visit should do to the schedule."""
     review_reasons: list[str] = []
     if not visit.known_provider:
@@ -350,6 +480,18 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
             "Service lines came from more than one check/EFT "
             f"({', '.join(sorted(visit.check_efts))}) - verify before applying"
         )
+
+    dx_value, dx_status, dx_note, dx_reason = _dx_for(visit, dx_lookup)
+    if dx_reason:
+        review_reasons.append(dx_reason)
+
+    audit = dict(
+        dx_value=dx_value,
+        dx_status=dx_status,
+        dx_note=dx_note,
+        processed_on=(today or date.today()).strftime(DATE_FMT),
+        check_eft_display=CHECK_EFT_JOINER.join(sorted(visit.check_efts)),
+    )
 
     candidates = _candidate_rows(visit, rows)
 
@@ -361,6 +503,7 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
             score=None,
             review_reasons=review_reasons,
             accepted=not review_reasons,
+            **audit,
         )
 
     chosen = _disambiguate(visit, candidates)
@@ -377,11 +520,12 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
             visit=visit,
             action=ACTION_REVIEW,
             row_num=top_row.row_num,
-            fills={} if top_row.payment_recorded else _fill_values(visit, top_row),
+            fills={} if top_row.payment_recorded else _fill_values(visit, top_row, dx_value),
             existing_billed=top_row.billed,
             score=candidates[0][1],
             review_reasons=review_reasons,
             accepted=False,
+            **audit,
         )
 
     row, score = chosen
@@ -393,6 +537,8 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
         )
 
     if row.payment_recorded:
+        # Already recorded: this row is left completely untouched, so no DX
+        # fill and no audit stamp.
         return Change(
             visit=visit,
             action=ACTION_SKIP,
@@ -401,6 +547,7 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
             score=score,
             review_reasons=[],
             accepted=False,
+            **audit,
         )
 
     if review_reasons:
@@ -408,28 +555,62 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow]) -> Change:
             visit=visit,
             action=ACTION_REVIEW,
             row_num=row.row_num,
-            fills=_fill_values(visit, row),
+            fills=_fill_values(visit, row, dx_value),
             existing_billed=row.billed,
             score=score,
             review_reasons=review_reasons,
             accepted=False,
+            **audit,
         )
 
     return Change(
         visit=visit,
         action=ACTION_FILL,
         row_num=row.row_num,
-        fills=_fill_values(visit, row),
+        fills=_fill_values(visit, row, dx_value),
         existing_billed=row.billed,
         score=score,
         review_reasons=[],
         accepted=True,
+        **audit,
     )
 
 
-def build_plan(visits: Iterable[Visit], rows: Sequence[ScheduleRow]) -> list[Change]:
+def build_plan(visits: Iterable[Visit], rows: Sequence[ScheduleRow],
+               dx_lookup: "DxLookup | None" = None,
+               today: date | None = None) -> list[Change]:
     """Plan every visit against the schedule, newest decisions last."""
-    return [plan_change(visit, rows) for visit in visits]
+    return [plan_change(visit, rows, dx_lookup, today) for visit in visits]
+
+
+def find_legacy_duplicate_rows(rows: Sequence[ScheduleRow]) -> list[tuple[ScheduleRow, ScheduleRow]]:
+    """Rows a previous run appended that now duplicate a suffix-name row.
+
+    Before generational suffixes were stripped for matching, a sheet row like
+    ``Marchetti Jr, Dean`` could fail to match ``MARCHETTI, DEAN`` and get a duplicate
+    appended in the app's old all-caps style. Those pairs are reported so they
+    can be cleaned up by hand -- nothing is deleted automatically.
+    """
+    pairs: list[tuple[ScheduleRow, ScheduleRow]] = []
+    for row in rows:
+        if is_blank(row.patient):
+            continue
+        name = str(row.patient)
+        # The app now writes Title Case, so an all-caps name is a legacy append.
+        if name != name.upper() or not any(ch.isalpha() for ch in name):
+            continue
+        for other in rows:
+            if other.row_num == row.row_num or is_blank(other.patient):
+                continue
+            other_name = str(other.patient)
+            if other_name == other_name.upper():
+                continue
+            if (row.data_date is not None
+                    and row.data_date == other.data_date
+                    and name_score(name, other_name) >= NAME_AUTO_MATCH_SCORE):
+                pairs.append((row, other))
+                break
+    return pairs
 
 
 def summarize(changes: Sequence[Change]) -> dict[str, int]:
@@ -443,12 +624,26 @@ def summarize(changes: Sequence[Change]) -> dict[str, int]:
     }
 
 
-def new_row_values(visit: Visit) -> dict[str, Any]:
-    """Column values for an appended row (DX is deliberately left blank)."""
-    from .config import COL_CPT, COL_DATA, COL_INS, COL_PATIENT, INSURANCE_VALUE
+def new_row_values(visit: Visit, dx: str | None = None,
+                   processed_on: str = "", check_eft: str = "") -> dict[str, Any]:
+    """Column values for an appended row.
 
-    return {
-        COL_PATIENT: visit.patient,
+    The patient name is written in the sheet's Title Case style rather than
+    Medicare's uppercase. ``DX`` stays blank unless the optional Mutual
+    workbook supplied one.
+    """
+    from .config import (
+        COL_CHECK_EFT,
+        COL_CPT,
+        COL_DATA,
+        COL_INS,
+        COL_PATIENT,
+        COL_PROCESSED_ON,
+        INSURANCE_VALUE,
+    )
+
+    values = {
+        COL_PATIENT: to_title_name(visit.patient),
         COL_INS: INSURANCE_VALUE,
         COL_DATA: visit.data_str,
         COL_BILLED: visit.billed_str,
@@ -457,3 +652,10 @@ def new_row_values(visit: Visit) -> dict[str, Any]:
         COL_COMMENT: visit.doctor,
         COL_CPT: "/".join(order_cpt_codes(visit.cpt_codes)),
     }
+    if dx:
+        values[COL_DX] = dx
+    if processed_on:
+        values[COL_PROCESSED_ON] = processed_on
+    if check_eft:
+        values[COL_CHECK_EFT] = check_eft
+    return values

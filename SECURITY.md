@@ -53,8 +53,14 @@ python scripts/check_for_phi.py
 
 This is a heuristic, not a guarantee — it looks for the specific identifiers
 this project has previously leaked (see `CHANGELOG.md` 1.1.0) and for
-MBI-shaped strings. It cannot know every possible real name. If you have
-`gitleaks` available, also run:
+MBI-shaped strings. It cannot know every possible real name.
+
+To block real patient surnames, create **`phi_denylist.local.txt`** in the repo
+root — one term per line, `#` for comments. It is gitignored, which is the
+point: a list of real patient names must never be committed, not even to a
+security tool. The checker picks it up automatically.
+
+If you have `gitleaks` available, also run:
 
 ```bash
 gitleaks detect --source . --no-git   # working tree

@@ -26,3 +26,6 @@ myenv/
 
 # The real clinic's provider mapping. Ship only npi_map.example.json.
 npi_map.local.json
+
+# Local-only PHI denylist for scripts/check_for_phi.py (real surnames etc).
+phi_denylist.local.txt

@@ -48,6 +48,23 @@ FIXTURE_ALLOWED_PREFIX = "tests/fixtures/"
 # check against, and would otherwise flag itself on every run.
 SELF_EXEMPT_PATH = "scripts/check_for_phi.py"
 
+# Optional, gitignored: one term per line (blank lines and #comments ignored).
+# Real patient surnames belong HERE, never in this tracked file -- listing them
+# in the repo would itself be the leak this script exists to prevent.
+LOCAL_DENYLIST_PATH = REPO_ROOT / "phi_denylist.local.txt"
+
+
+def local_denylist() -> list[str]:
+    """Extra terms to block, read from an untracked local file if present."""
+    if not LOCAL_DENYLIST_PATH.is_file():
+        return []
+    terms = []
+    for line in LOCAL_DENYLIST_PATH.read_text(encoding="utf-8").splitlines():
+        term = line.strip()
+        if term and not term.startswith("#"):
+            terms.append(term)
+    return terms
+
 
 def staged_files() -> list[str]:
     out = subprocess.run(
@@ -76,7 +93,7 @@ def staged_text(path: str) -> str | None:
         return None  # binary file; handled separately by the extension check
 
 
-def check_file(path: str, get_text) -> list[str]:
+def check_file(path: str, get_text, extra_terms: list[str] | None = None) -> list[str]:
     if path == SELF_EXEMPT_PATH:
         return []
 
@@ -97,6 +114,9 @@ def check_file(path: str, get_text) -> list[str]:
     for needle in RETIRED_REAL_STRINGS:
         if needle in text:
             problems.append(f"{path}: retired real identifier '{needle}'")
+    for needle in extra_terms or []:
+        if needle.lower() in text.lower():
+            problems.append(f"{path}: term from phi_denylist.local.txt ('{needle}')")
 
     return problems
 
@@ -116,9 +136,10 @@ def main() -> int:
         files = staged_files()
         get_text = staged_text
 
+    extra_terms = local_denylist()
     problems: list[str] = []
     for path in files:
-        problems.extend(check_file(path, get_text))
+        problems.extend(check_file(path, get_text, extra_terms))
 
     if problems:
         print("check_for_phi: possible PHI/real-identifier found:\n", file=sys.stderr)

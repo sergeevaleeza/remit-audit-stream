@@ -18,9 +18,10 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
-from .fixtures.synthetic_remit_data import SCHEDULE_ONLY_PATIENT
+from .fixtures.synthetic_remit_data import MUTUAL_ROWS, SCHEDULE_ONLY_PATIENT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "List_of_Patients_Schedule.xlsx"
+MUTUAL_FIXTURE = Path(__file__).parent / "fixtures" / "List_of_Patients_Mutual.xlsx"
 
 HEADERS = [
     "Patient", "Ins", "Data", "Billed", "Payment", "Co-pay",
@@ -62,6 +63,11 @@ ROWS = [
     # --- Trailing middle initial in the remit -------------------------------
     ["Sorensen, Marcus", "Medicare", datetime(2026, 5, 14), "2/32/26",
      None, None, None, None, None, DX, "99213/90836"],
+
+    # --- Generational suffix in the sheet, absent from the remit ------------
+    # DX is left blank here so the Mutual-file fill path has something to do.
+    ["Bystritskaya Jr, Anna", "Medicare", datetime(2026, 4, 14), "2/32/26",
+     None, None, None, None, None, None, "99213/90833"],
 
     # --- Date present in the sheet but not in the remit ---------------------
     [SCHEDULE_ONLY_PATIENT["schedule_name"], "Medicare", datetime(2026, 1, 5), "2/32/26",
@@ -105,10 +111,37 @@ def build() -> Workbook:
     return workbook
 
 
+def build_mutual() -> Workbook:
+    """The optional DX reference workbook: sheet `Active`, no header row.
+
+    Column A = Patient, B = DX, E = attending doctor. C, D and E exist only
+    for structural realism -- the app reads A and B and nothing else.
+    """
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Active"
+
+    for index, (patient, dx, attending) in enumerate(MUTUAL_ROWS, start=1):
+        sheet.cell(row=index, column=1, value=patient)
+        sheet.cell(row=index, column=2, value=dx)
+        sheet.cell(row=index, column=3, value="unused")
+        sheet.cell(row=index, column=4, value="unused")
+        sheet.cell(row=index, column=5, value=attending)
+
+    # A second sheet the app must ignore entirely.
+    inactive = workbook.create_sheet("Inactive")
+    inactive["A1"] = "Former, Patient"
+    inactive["B1"] = "F99.9"
+
+    return workbook
+
+
 def main() -> None:
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     build().save(FIXTURE)
     print(f"wrote {FIXTURE}")
+    build_mutual().save(MUTUAL_FIXTURE)
+    print(f"wrote {MUTUAL_FIXTURE}")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,15 @@ COL_COMMENT = "Comment"
 COL_DX = "DX"
 COL_CPT = "CPT Code"
 
+#: Audit columns the app maintains itself, appended after CPT Code (L and M in
+#: the standard layout). Created on demand if the sheet does not have them yet.
+COL_PROCESSED_ON = "Processed On"
+COL_CHECK_EFT = "Remit Check/EFT #"
+AUDIT_COLUMNS = (COL_PROCESSED_ON, COL_CHECK_EFT)
+
+#: Joins several check/EFT numbers when more than one remit feeds one row.
+CHECK_EFT_JOINER = "; "
+
 REQUIRED_COLUMNS = (
     COL_PATIENT,
     COL_INS,
@@ -43,7 +52,7 @@ REQUIRED_COLUMNS = (
     COL_CPT,
 )
 
-ALL_COLUMNS = REQUIRED_COLUMNS + (COL_COPAYS_PAID, COL_OFFICE, COL_DX)
+ALL_COLUMNS = REQUIRED_COLUMNS + (COL_COPAYS_PAID, COL_OFFICE, COL_DX) + AUDIT_COLUMNS
 
 #: Cells this app is ever permitted to write on an existing row.
 FILLABLE_COLUMNS = (COL_BILLED, COL_PAYMENT, COL_COPAY, COL_COMMENT)
@@ -141,3 +150,47 @@ ACTION_REVIEW = "Needs review"
 
 #: Two-digit years are expanded into this century.
 CENTURY_PREFIX = 2000
+
+# --- Name normalisation -----------------------------------------------------
+
+#: Generational suffixes stripped from the surname before names are compared,
+#: so `Marchetti Jr` and `MARCHETTI` resolve to the same person. Matched
+#: case-insensitively, with or without a trailing period. The stored name in
+#: the sheet is never rewritten -- this only affects comparison.
+GENERATIONAL_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
+#: How each suffix is rendered when the app writes a *new* name, matching the
+#: sheet's existing convention (`Marchetti Jr, Dean` -- no period).
+GENERATIONAL_SUFFIX_TITLES = {
+    "jr": "Jr",
+    "sr": "Sr",
+    "ii": "II",
+    "iii": "III",
+    "iv": "IV",
+    "v": "V",
+}
+
+# --- Mutual (DX reference) workbook -----------------------------------------
+
+#: The optional `List_of_Patients_Mutual.xlsx` upload used to source DX codes.
+MUTUAL_SHEET_NAME = "Active"
+
+#: That sheet has NO header row -- data starts on row 1 and is read
+#: positionally. Column E (attending doctor) exists but is deliberately unused.
+MUTUAL_DATA_START_ROW = 1
+MUTUAL_COL_PATIENT = 1  # column A
+MUTUAL_COL_DX = 2       # column B
+
+#: When True, a blank `DX` on an existing row the app is already filling is
+#: populated from the Mutual file too. Set False to restrict DX to new rows.
+#: A non-blank DX is never overwritten either way, and rows the app skips
+#: (already paid) are never touched.
+FILL_DX_ON_EXISTING = True
+
+# --- DX lookup outcomes -----------------------------------------------------
+
+DX_FOUND = "found"
+DX_NOT_FOUND = "not found"
+DX_CONFLICT = "conflict"
+DX_AMBIGUOUS = "ambiguous"
+DX_NO_FILE = "no file"

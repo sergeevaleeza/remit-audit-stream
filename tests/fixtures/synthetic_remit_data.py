@@ -220,6 +220,23 @@ ROSTER: list[Patient] = [
             ),
         ],
     ),
+    # Schedule row carries a generational suffix the remit does not print.
+    # The surname also has a Slavic feminine ending, so the suffix must be
+    # stripped *before* harmonisation or the two sides will not agree.
+    Patient(
+        key="bystritskaya",
+        schedule_name="Bystritskaya Jr, Anna",
+        printed_name="BYSTRITSKAYA, ANNA",
+        mbi_seed="0010",
+        acct="BYSTRA",
+        claims=[
+            ClaimBlock(
+                "BYSTRITSKAYA, ANNA", _mbi("0010"), "BYSTRA", "9999900000014",
+                [ServiceLineSpec("99213", "2026-04-14"),
+                 ServiceLineSpec("90833", "2026-04-14")],
+            ),
+        ],
+    ),
     # In the remit only -- absent from the schedule entirely -> New row.
     Patient(
         key="whitcombe",
@@ -238,3 +255,26 @@ ROSTER: list[Patient] = [
 
 # In the schedule only -- never appears in the remit at all.
 SCHEDULE_ONLY_PATIENT = dict(key="delacroix", schedule_name="Delacroix, Owen")
+
+# --- Mutual (DX reference) fixture ------------------------------------------
+# Fictional diagnoses for the fictional roster above. The `Active` sheet has
+# no header row; column A is the patient, B the DX, E the attending doctor
+# (present for realism, deliberately never read by the app).
+#
+# (patient, dx, attending)
+MUTUAL_ROWS: list[tuple[str, str, str]] = [
+    ("Marlowe, Diane", "F41.1, F32.9", "Dr. A"),
+    ("Thackeray, Renata", "F33.1, G47.00", "Dr. A"),
+    ("Whitfield, Harold", "F43.21", "Dr. B"),
+    ("Castellano, Miguel", "F41.9, F51.01", "Dr. A"),
+    ("Featherstonehaugh, Wilhelmina", "F31.81", "Dr. A"),
+    ("Sorensen, Marcus", "F40.10", "Dr. B"),
+    # Suffix in the Mutual file too -- must still match the remit's plain name.
+    ("Bystritskaya Jr, Anna", "F42.2", "Dr. A"),
+    # Present in the remit but with a DX conflict: two rows, different codes.
+    ("Whitcombe, Rosalind", "F34.1", "Dr. A"),
+    ("Whitcombe, Rosalind", "F33.2", "Dr. C"),
+    # Someone who never appears in the remit at all.
+    ("Delacroix, Owen", "F90.0", "Dr. B"),
+    # OKAFOR and PETROSSIAN are deliberately absent -> DX left blank.
+]

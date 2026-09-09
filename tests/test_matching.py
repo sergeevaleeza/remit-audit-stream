@@ -216,8 +216,9 @@ def test_new_row_is_appended_with_the_expected_values(schedule_bytes, visits, sc
     assert stats["appended_rows"] == 1
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
 
-    row = 13  # first row after the 10 fixture rows (3..12)
-    assert worksheet.cell(row=row, column=1).value == "WHITCOMBE, ROSALIND"
+    row = len(schedule[3]) + 3  # first row after the existing fixture rows
+    # Written in the sheet's Title Case style, not Medicare's uppercase.
+    assert worksheet.cell(row=row, column=1).value == "Whitcombe, Rosalind"
     assert worksheet.cell(row=row, column=2).value == "Medicare"
     assert worksheet.cell(row=row, column=3).value == "05/06/2026"
     assert worksheet.cell(row=row, column=5).value == 166.37
@@ -231,15 +232,17 @@ def test_new_row_dates_are_written_as_text_not_serials(schedule_bytes, visits, s
     visit = find_visit(visits, "WHITCOMBE, ROSALIND", date(2026, 5, 6))
     updated, _ = build_updated_workbook(schedule_bytes, build_plan([visit], schedule[3]))
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
-    assert isinstance(worksheet.cell(row=13, column=3).value, str)
-    assert isinstance(worksheet.cell(row=13, column=4).value, str)
+    row = len(schedule[3]) + 3
+    assert isinstance(worksheet.cell(row=row, column=3).value, str)
+    assert isinstance(worksheet.cell(row=row, column=4).value, str)
 
 
-def test_new_rows_do_not_disturb_existing_rows(schedule_bytes, plan):
+def test_new_rows_do_not_disturb_existing_rows(schedule_bytes, plan, schedule):
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
     assert worksheet.cell(row=3, column=1).value == "Marlowe, Diane"
-    assert worksheet.cell(row=12, column=1).value == "Delacroix, Owen"
+    last_existing = len(schedule[3]) + 2
+    assert worksheet.cell(row=last_existing, column=1).value == "Delacroix, Owen"
 
 
 # --- Name normalisation ----------------------------------------------------

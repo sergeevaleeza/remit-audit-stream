@@ -3,6 +3,85 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] — 2026-09-08
+
+Four incremental changes to matching and output. All existing behaviour is
+preserved: parse → preview → confirm → download, never-overwrite, dedup /
+idempotency, and whole-workbook preservation. Test count went from 90 to 174.
+
+### Added
+
+- **Generational suffixes are stripped for name comparison.** `Marchetti Jr, Dean`
+  in the schedule now matches `MARCHETTI, DEAN` in the remit and is *filled*
+  instead of duplicated. `JR`, `SR`, `II`, `III`, `IV` and `V` are removed
+  (case-insensitive, with or without a trailing period) from the surname
+  before comparison — including before the Slavic/Armenian harmonisation, so a
+  suffix can no longer stop those rules firing. The stored name is never
+  rewritten, and an exact parsed-date match is still required, so stripping a
+  suffix cannot cause a cross-person match. Applies everywhere names are
+  compared, including the new Mutual lookup.
+- **`to_title_name()`** — names on *newly appended* rows are written in the
+  sheet's style (`Marchetti, Dean`, not `MARCHETTI, DEAN`). Handles hyphens
+  (`SMITH-JONES` → `Smith-Jones`), apostrophes (`O'BRIEN` → `O'Brien`), `Mc`
+  (`MCDONALD` → `McDonald`), single-letter middle initials
+  (`CURRAN, THOMAS M` → `Curran, Thomas M`) and suffixes (`JR` → `Jr`, roman
+  numerals left uppercase). Existing names are never touched.
+- **Optional third upload: `List_of_Patients_Mutual.xlsx`** (`remit/mutual.py`).
+  Reads only the `Active` sheet, which has **no header row** — column A is the
+  patient and column B the DX, read positionally from row 1. Column E
+  (attending doctor) is deliberately not read and no doctor aliasing is
+  implemented. The DX fills blank `DX` cells on new rows and on existing rows
+  the app is already filling (`FILL_DX_ON_EXISTING`, default `True`). A
+  non-blank DX is never overwritten. A patient missing from the file leaves DX
+  blank; a patient listed twice with different codes uses the first and flags
+  the conflict; a low-confidence name match is flagged *Needs review* and
+  leaves DX blank. Without the upload, behaviour is exactly as before.
+- **Audit columns `Processed On` (L) and `Remit Check/EFT #` (M)**, with
+  headers created in row 2 on first use, inheriting the header row's
+  formatting. Every row the app creates or fills this run is stamped with the
+  run date (`MM/DD/YYYY`, reusing `DATE_FMT`) and the originating
+  `CHECK/EFT #` (joined with `; ` if several remits feed one row). These are
+  the app's own columns, so they are refreshed rather than only filled when
+  blank — rows the app skips or never touches are left unchanged.
+- **Leftover-duplicate detection.** `find_legacy_duplicate_rows()` reports
+  all-caps rows a previous run appended that now match a suffix-bearing row on
+  the same date, surfaced as a preview warning. Nothing is deleted
+  automatically.
+- Synthetic `tests/fixtures/List_of_Patients_Mutual.xlsx` (fictional names and
+  diagnoses), plus a suffix-bearing patient (`Bystritskaya Jr, Anna`) added to
+  the synthetic roster to cover the suffix path end to end.
+- 84 new tests across `tests/test_name_handling.py`, `tests/test_mutual_dx.py`
+  and `tests/test_audit_columns.py`.
+
+### Changed
+
+- The preview table gained `DX (from Mutual)`, `Processed On` and
+  `Remit Check/EFT #` columns; the summary line reports whether a DX reference
+  was loaded, and DX conflicts in the reference file are listed separately.
+- `build_plan()` / `plan_change()` take an optional `dx_lookup` and `today`;
+  `new_row_values()` takes optional `dx`, `processed_on` and `check_eft`.
+- `README.md` — new features, the Mutual upload and its column mapping, the DX
+  fill rules, the audit columns, and limitations covering `Mac` surnames and
+  leftover duplicates.
+
+### Notes
+
+- **DX is not filled on skipped rows.** The brief asked for blank `DX` on
+  "existing rows" to be filled, but Change 4 also requires that rows the app
+  skips (already paid) are left unchanged, and the idempotency guarantee
+  depends on it. DX filling is therefore scoped to rows the app is already
+  touching — fills and new rows.
+- **The reported `Marchetti Jr` symptom had a second cause.** Suffix names already
+  scored 100% via an incidental prefix match, so the duplicate seen in
+  practice came from the *date* not being present on the matched row rather
+  than from the name. Explicit suffix stripping is still the right fix: it
+  makes the match intentional rather than accidental, and it repairs a real
+  failure where a suffix blocked surname harmonisation (a Slavic feminine
+  surname with `Jr` scored 88% — below the 92% auto-match threshold — and is
+  now 100%). That case is covered by a regression test.
+
+---
+
 ## [1.1.0] — 2026-09-08
 
 De-identified the repository before it is pushed to GitHub. The initial build
@@ -230,5 +309,6 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.2.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.2.0
 [1.1.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.1.0
 [1.0.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.0.0

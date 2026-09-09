@@ -21,7 +21,9 @@ from .config import (
     ACTION_FILL,
     ACTION_NEW,
     ALL_COLUMNS,
+    AUDIT_COLUMNS,
     COL_BILLED,
+    COL_CHECK_EFT,
     COL_COMMENT,
     COL_COPAY,
     COL_CPT,
@@ -30,6 +32,7 @@ from .config import (
     COL_INS,
     COL_PATIENT,
     COL_PAYMENT,
+    COL_PROCESSED_ON,
     DATA_START_ROW,
     HEADER_ROW,
     NEVER_TOUCH_COLUMNS,
@@ -164,6 +167,52 @@ def _copy_style(source_cell, target_cell) -> None:
         target_cell.protection = copy(source_cell.protection)
 
 
+def _first_empty_header_column(worksheet: Worksheet) -> int:
+    """The first column whose header cell in row 2 is empty."""
+    column = 1
+    while not is_blank(worksheet.cell(row=HEADER_ROW, column=column).value):
+        column += 1
+    return column
+
+
+def ensure_audit_columns(worksheet: Worksheet,
+                         columns: dict[str, int]) -> dict[str, int]:
+    """Locate the app's audit columns, creating their headers if missing.
+
+    `Processed On` and `Remit Check/EFT #` land in the first empty header
+    cells after the existing columns (L and M in the standard layout) and
+    inherit the header row's formatting.
+    """
+    resolved = dict(columns)
+    template = worksheet.cell(row=HEADER_ROW, column=max(columns.values()))
+
+    for header in AUDIT_COLUMNS:
+        if header in resolved:
+            continue
+        column = _first_empty_header_column(worksheet)
+        cell = worksheet.cell(row=HEADER_ROW, column=column, value=header)
+        _copy_style(template, cell)
+        resolved[header] = column
+
+    return resolved
+
+
+def _stamp_audit(worksheet: Worksheet, columns: dict[str, int],
+                 row_num: int, change: Change) -> None:
+    """Write this run's audit stamps onto a row the app created or filled.
+
+    These are the app's own columns, so unlike every other column they are
+    overwritten rather than only filled when blank.
+    """
+    for header, value in (
+        (COL_PROCESSED_ON, change.processed_on),
+        (COL_CHECK_EFT, change.check_eft_display),
+    ):
+        column = columns.get(header)
+        if column and value:
+            worksheet.cell(row=row_num, column=column).value = value
+
+
 def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dict[str, int]:
     """Apply accepted fills and appends in place. Returns what was written.
 
@@ -174,15 +223,21 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
     worksheet = get_schedule_sheet(workbook)
     columns = resolve_columns(worksheet)
 
+    applies = [
+        change for change in changes
+        if change.accepted and change.effective_action in (ACTION_FILL, ACTION_NEW)
+    ]
+    # Only touch the header row when there is actually something to stamp.
+    if applies:
+        columns = ensure_audit_columns(worksheet, columns)
+
     filled_cells = 0
     filled_rows = 0
     appended_rows = 0
     skipped_non_blank = 0
 
-    for change in changes:
-        if (not change.accepted
-                or change.effective_action != ACTION_FILL
-                or change.row_num is None):
+    for change in applies:
+        if change.effective_action != ACTION_FILL or change.row_num is None:
             continue
         wrote_any = False
         for header, value in change.fills.items():
@@ -200,13 +255,19 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
             wrote_any = True
         if wrote_any:
             filled_rows += 1
+            _stamp_audit(worksheet, columns, change.row_num, change)
 
     template_row = last_data_row(worksheet, columns)
     next_row = template_row + 1
-    for change in changes:
-        if not change.accepted or change.effective_action != ACTION_NEW:
+    for change in applies:
+        if change.effective_action != ACTION_NEW:
             continue
-        values = new_row_values(change.visit)
+        values = new_row_values(
+            change.visit,
+            dx=change.dx_value,
+            processed_on=change.processed_on,
+            check_eft=change.check_eft_display,
+        )
         for header, column in columns.items():
             if header in NEVER_TOUCH_COLUMNS:
                 continue
@@ -214,7 +275,7 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
             if template_row >= DATA_START_ROW:
                 _copy_style(worksheet.cell(row=template_row, column=column), target)
             value = values.get(header)
-            # DX is intentionally absent from values, so it stays blank.
+            # DX is absent from values unless the Mutual file supplied one.
             if value not in (None, ""):
                 target.value = value
         appended_rows += 1

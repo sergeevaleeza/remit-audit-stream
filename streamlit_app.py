@@ -31,7 +31,8 @@ from remit.excel_updater import (
     read_schedule_rows,
     resolve_columns,
 )
-from remit.matching import build_plan, summarize
+from remit.matching import build_plan, find_legacy_duplicate_rows, summarize
+from remit.mutual import load_dx_lookup
 from remit.pdf_parser import parse_remittances
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -39,12 +40,16 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 st.set_page_config(page_title="Remittance → Schedule Updater", page_icon="🧾", layout="wide")
 
 
-def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]]) -> str:
+def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]],
+                     mutual_bytes: bytes | None) -> str:
     """Stable id for one set of uploads, so parsing only reruns when they change."""
     digest = hashlib.sha256(schedule_bytes)
     for payload, name in pdf_payloads:
         digest.update(name.encode("utf-8"))
         digest.update(payload)
+    if mutual_bytes:
+        digest.update(b"mutual")
+        digest.update(mutual_bytes)
     return digest.hexdigest()
 
 
@@ -63,9 +68,12 @@ def plan_to_frame(changes) -> pd.DataFrame:
                 "Co-pay": change.visit.copay,
                 "Proposed Billed": change.visit.billed_str,
                 "Existing Billed": "" if change.existing_billed is None else str(change.existing_billed),
+                "DX (from Mutual)": change.dx_display,
                 "Matched row": change.row_num or "—",
                 "Match %": "—" if change.score is None else f"{change.score:.0f}",
                 "Will write": ", ".join(change.fills) if change.fills else "—",
+                "Processed On": change.processed_on,
+                "Remit Check/EFT #": change.check_eft_display,
             }
             for change in changes
         ]
@@ -104,6 +112,25 @@ def render_review_items(changes) -> None:
                 st.markdown(f"- {reason}")
 
 
+def render_legacy_duplicates(rows) -> None:
+    """Flag old all-caps appends that now match a suffix name in the sheet."""
+    pairs = find_legacy_duplicate_rows(rows)
+    if not pairs:
+        return
+    st.warning(
+        f"{len(pairs)} row(s) look like duplicates a previous run appended "
+        "before generational suffixes were matched. Nothing is deleted "
+        "automatically — review and remove them by hand."
+    )
+    with st.expander("Possible leftover duplicate rows", expanded=False):
+        for duplicate, original in pairs:
+            st.markdown(
+                f"- Row **{duplicate.row_num}** `{duplicate.patient}` duplicates "
+                f"row **{original.row_num}** `{original.patient}` "
+                f"on {duplicate.data}"
+            )
+
+
 def warn_on_duplicate_checks(documents) -> None:
     """A check number appearing twice in one batch usually means a re-upload."""
     counts = Counter(doc.check_eft for doc in documents if doc.check_eft)
@@ -125,11 +152,13 @@ with st.sidebar:
         f"""
 1. Upload `List_of_Patients_Schedule.xlsx`
 2. Upload one or more remittance PDFs
-3. Review every proposed change
-4. Confirm and download the updated copy
+3. Optionally upload `List_of_Patients_Mutual.xlsx` for DX codes
+4. Review every proposed change
+5. Confirm and download the updated copy
 
 Only the **{SHEET_NAME}** sheet is touched. Blank cells are the only cells
-ever written — an existing value is never overwritten.
+ever written — an existing value is never overwritten. The app stamps its own
+`Processed On` and `Remit Check/EFT #` columns on rows it creates or fills.
 """
     )
     st.subheader("Provider NPI → Comment")
@@ -150,14 +179,20 @@ st.caption(
     f"`{SHEET_NAME}` sheet. Nothing is written until you confirm."
 )
 
-left, right = st.columns(2)
+left, middle, right = st.columns(3)
 with left:
     schedule_upload = st.file_uploader(
         "1 · Patient schedule (.xlsx)", type=["xlsx"], accept_multiple_files=False
     )
-with right:
+with middle:
     pdf_uploads = st.file_uploader(
         "2 · Medicare remittance PDFs", type=["pdf"], accept_multiple_files=True
+    )
+with right:
+    mutual_upload = st.file_uploader(
+        "3 · DX reference (optional)", type=["xlsx"], accept_multiple_files=False,
+        help="List_of_Patients_Mutual.xlsx — sheet 'Active'. Supplies the DX "
+             "column. Without it, DX is left blank as before.",
     )
 
 if not schedule_upload or not pdf_uploads:
@@ -166,7 +201,8 @@ if not schedule_upload or not pdf_uploads:
 
 schedule_bytes = schedule_upload.getvalue()
 pdf_payloads = [(upload.getvalue(), upload.name) for upload in pdf_uploads]
-signature = upload_signature(schedule_bytes, pdf_payloads)
+mutual_bytes = mutual_upload.getvalue() if mutual_upload else None
+signature = upload_signature(schedule_bytes, pdf_payloads, mutual_bytes)
 
 
 # --- Parse (only when the uploads change) ----------------------------------
@@ -193,22 +229,49 @@ if st.session_state.get("signature") != signature:
             st.error(f"Could not parse the PDFs: {error}")
             st.stop()
 
+    dx_lookup = None
+    if mutual_bytes:
+        try:
+            dx_lookup = load_dx_lookup(mutual_bytes, mutual_upload.name)
+        except ScheduleError as error:
+            st.error(str(error))
+            st.stop()
+        except Exception as error:  # noqa: BLE001
+            st.error(f"Could not read the DX reference workbook: {error}")
+            st.stop()
+
     st.session_state.update(
         signature=signature,
         documents=documents,
-        plan=build_plan(visits, rows),
+        plan=build_plan(visits, rows, dx_lookup),
         schedule_row_count=len(rows),
+        schedule_rows=rows,
+        dx_entry_count=len(dx_lookup) if dx_lookup else 0,
+        dx_conflicts=dx_lookup.conflicts if dx_lookup else {},
         generated=None,
     )
 
 documents = st.session_state["documents"]
 plan = st.session_state["plan"]
 
+dx_entry_count = st.session_state.get("dx_entry_count", 0)
 st.success(
     f"Read {st.session_state['schedule_row_count']} schedule rows from "
     f"`{SHEET_NAME}` and {sum(d.claim_count for d in documents)} claims "
     f"from {len(documents)} PDF(s)."
+    + (f" DX reference loaded: {dx_entry_count} patient(s)." if dx_entry_count
+       else " No DX reference uploaded — DX will be left blank.")
 )
+
+dx_conflicts = st.session_state.get("dx_conflicts") or {}
+if dx_conflicts:
+    st.warning(
+        f"{len(dx_conflicts)} patient(s) appear more than once in the DX "
+        "reference with different codes. The first is used; check these:"
+    )
+    with st.expander("DX conflicts in the reference file", expanded=False):
+        for key, values in dx_conflicts.items():
+            st.markdown(f"- `{key.replace('|', ', ')}` → {', '.join(values)}")
 
 with st.expander("Parsed remittance files", expanded=False):
     st.dataframe(
@@ -238,6 +301,7 @@ warn_on_duplicate_checks(documents)
 st.header("Preview proposed changes")
 render_summary(summarize(plan))
 render_review_items(plan)
+render_legacy_duplicates(st.session_state.get("schedule_rows") or [])
 
 actionable = [c for c in plan if c.action != ACTION_SKIP]
 show_skipped = st.checkbox(
@@ -254,7 +318,9 @@ if not visible:
 st.caption(
     "Untick any row you do not want applied. **Existing Billed** is shown next to "
     "the proposed value: where a placeholder like `2/32/26` is already present it "
-    "is left in place, so fix those by hand if needed."
+    "is left in place, so fix those by hand if needed. **DX (from Mutual)** shows "
+    "what would be written into a blank DX cell; `(not found)` means the patient "
+    "is not in the reference file and DX stays blank."
 )
 
 preview = plan_to_frame(visible)
