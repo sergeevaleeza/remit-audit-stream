@@ -1,0 +1,6 @@
+# Pinned to minor versions that are known to work on Streamlit Community Cloud.
+streamlit~=1.59
+pandas~=2.3
+openpyxl~=3.1
+pdfplumber~=0.11
+rapidfuzz~=3.14

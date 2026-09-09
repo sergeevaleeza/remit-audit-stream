@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest~=9.1
+
+# Only needed to regenerate tests/fixtures/RemitDoc-0000000001.PDF; not used
+# by the app or by the test suite itself.
+reportlab~=5.0

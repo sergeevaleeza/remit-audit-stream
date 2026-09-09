@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this file to npi_map.local.json (repo root) and fill in your clinic's real PERF PROV NPIs and doctor names. npi_map.local.json is gitignored and never committed. Keys are 10-digit NPIs as they appear on the remittance service lines; values are the text written into the Comment column.",
+  "1000000001": "Dr. A",
+  "1000000002": "Dr. B",
+  "1000000003": "Dr. C"
+}

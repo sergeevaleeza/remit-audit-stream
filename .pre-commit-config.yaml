@@ -1,0 +1,16 @@
+# Optional. Install with:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Runs the project's own PHI heuristic (scripts/check_for_phi.py) on every
+# commit. See SECURITY.md for the full policy and for gitleaks as a
+# complementary, more general secret scanner.
+repos:
+  - repo: local
+    hooks:
+      - id: check-for-phi
+        name: Check staged changes for known real identifiers
+        entry: python scripts/check_for_phi.py
+        language: system
+        pass_filenames: false
+        always_run: true

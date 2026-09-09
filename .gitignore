@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+myenv/
+.DS_Store
+.idea/
+.vscode/
+*.egg-info/
+
+# Never commit real patient data. The files under tests/fixtures/ are the only
+# intentionally tracked exception.
+/*.xlsx
+/*.PDF
+/*.pdf
+*_updated.xlsx
+.env
+.env.*
+.streamlit/secrets.toml
+.ipynb_checkpoints/
+/data/
+/private/
+/local/
+
+# The real clinic's provider mapping. Ship only npi_map.example.json.
+npi_map.local.json

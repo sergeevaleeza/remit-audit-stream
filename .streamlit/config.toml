@@ -1,0 +1,6 @@
+[server]
+# Remittance PDFs and the schedule workbook are both comfortably under this.
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
