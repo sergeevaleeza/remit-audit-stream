@@ -332,9 +332,33 @@ class Change:
     processed_on: str = ""
     check_eft_display: str = ""
 
+    #: Where a *new* row goes: directly under this patient's last existing row,
+    #: or at the bottom of the sheet when the patient is not in the schedule.
+    #: Row numbers refer to the original layout, before any insertion.
+    anchor_row: int | None = None
+    anchor_patient: str | None = None
+    #: Set when a structurally unsafe anchor forced a bottom append instead.
+    placement_fallback: str = ""
+
     @property
     def needs_review(self) -> bool:
         return self.action == ACTION_REVIEW
+
+    @property
+    def inserts_under_patient(self) -> bool:
+        """True when this new row is grouped under an existing patient."""
+        return self.anchor_row is not None and not self.placement_fallback
+
+    @property
+    def placement_display(self) -> str:
+        """The preview's placement column, for new rows."""
+        if self.effective_action != ACTION_NEW:
+            return ""
+        if self.placement_fallback:
+            return f"appended ({self.placement_fallback})"
+        if self.anchor_row is not None:
+            return f'under existing "{self.anchor_patient}"'
+        return "appended (patient not in schedule)"
 
     @property
     def dx_display(self) -> str:
@@ -447,6 +471,29 @@ def _fill_values(visit: Visit, row: ScheduleRow,
     return fills
 
 
+def find_patient_anchor(visit: Visit,
+                        rows: Sequence[ScheduleRow]) -> tuple[int | None, str | None]:
+    """The last existing row belonging to this visit's patient, if any.
+
+    A new row for a patient who is already in the schedule is inserted
+    directly beneath this anchor so each person's rows stay together. Uses the
+    same suffix-aware, normalised matching as everything else, so
+    ``MARCHETTI, DEAN`` anchors under ``Marchetti Jr, Dean``. Rows are not
+    required to be contiguous -- the *last* occurrence wins.
+    """
+    anchor_row: int | None = None
+    anchor_patient: str | None = None
+    for row in rows:
+        if is_blank(row.patient):
+            continue
+        if name_score(visit.patient, str(row.patient)) < NAME_AUTO_MATCH_SCORE:
+            continue
+        if anchor_row is None or row.row_num > anchor_row:
+            anchor_row = row.row_num
+            anchor_patient = str(row.patient)
+    return anchor_row, anchor_patient
+
+
 def _dx_for(visit: Visit, dx_lookup: "DxLookup | None") -> tuple[str | None, str, str, str | None]:
     """(dx value, status, preview note, review reason) for one visit."""
     if dx_lookup is None:
@@ -485,12 +532,16 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
     if dx_reason:
         review_reasons.append(dx_reason)
 
+    anchor_row, anchor_patient = find_patient_anchor(visit, rows)
+
     audit = dict(
         dx_value=dx_value,
         dx_status=dx_status,
         dx_note=dx_note,
         processed_on=(today or date.today()).strftime(DATE_FMT),
         check_eft_display=CHECK_EFT_JOINER.join(sorted(visit.check_efts)),
+        anchor_row=anchor_row,
+        anchor_patient=anchor_patient,
     )
 
     candidates = _candidate_rows(visit, rows)

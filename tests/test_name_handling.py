@@ -19,7 +19,7 @@ from remit.matching import (
     to_title_name,
 )
 
-from .conftest import find_visit
+from .conftest import find_row, find_visit
 from .test_app_and_edges import make_row, make_visit
 
 
@@ -173,4 +173,7 @@ def test_existing_names_are_never_rewritten(schedule_bytes, visits, schedule_row
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
 
     for row in schedule_rows:
-        assert worksheet.cell(row=row.row_num, column=1).value == row.patient
+        # Rows may have moved (new visits insert under their patient), so
+        # locate each by identity and confirm the spelling is byte-identical.
+        found = find_row(worksheet, str(row.patient), row.data)
+        assert found["Patient"] == row.patient

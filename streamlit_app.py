@@ -24,6 +24,7 @@ from remit.config import (
 )
 from remit.excel_updater import (
     ScheduleError,
+    annotate_placement,
     build_updated_workbook,
     download_filename,
     get_schedule_sheet,
@@ -69,6 +70,7 @@ def plan_to_frame(changes) -> pd.DataFrame:
                 "Proposed Billed": change.visit.billed_str,
                 "Existing Billed": "" if change.existing_billed is None else str(change.existing_billed),
                 "DX (from Mutual)": change.dx_display,
+                "Placement": change.placement_display or "—",
                 "Matched row": change.row_num or "—",
                 "Match %": "—" if change.score is None else f"{change.score:.0f}",
                 "Will write": ", ".join(change.fills) if change.fills else "—",
@@ -240,10 +242,16 @@ if st.session_state.get("signature") != signature:
             st.error(f"Could not read the DX reference workbook: {error}")
             st.stop()
 
+    plan = build_plan(visits, rows, dx_lookup)
+    # Flag any anchor that would be unsafe to insert under, so the preview can
+    # say the row will be appended instead. apply_changes re-checks this
+    # independently, so correctness never depends on this annotation.
+    annotate_placement(worksheet, columns, plan)
+
     st.session_state.update(
         signature=signature,
         documents=documents,
-        plan=build_plan(visits, rows, dx_lookup),
+        plan=plan,
         schedule_row_count=len(rows),
         schedule_rows=rows,
         dx_entry_count=len(dx_lookup) if dx_lookup else 0,
@@ -320,7 +328,9 @@ st.caption(
     "the proposed value: where a placeholder like `2/32/26` is already present it "
     "is left in place, so fix those by hand if needed. **DX (from Mutual)** shows "
     "what would be written into a blank DX cell; `(not found)` means the patient "
-    "is not in the reference file and DX stays blank."
+    "is not in the reference file and DX stays blank. **Placement** shows where a "
+    "new row will go: grouped under that patient's existing rows, or appended at "
+    "the bottom when the patient is not in the schedule."
 )
 
 preview = plan_to_frame(visible)
@@ -346,14 +356,20 @@ accepted_fills = sum(
 accepted_new = sum(
     1 for c in plan if c.accepted and c.effective_action == ACTION_NEW
 )
+accepted_grouped = sum(
+    1 for c in plan
+    if c.accepted and c.effective_action == ACTION_NEW and c.inserts_under_patient
+)
 
 
 # --- Confirm ---------------------------------------------------------------
 
 st.header("Confirm")
 st.markdown(
-    f"Ready to fill **{accepted_fills}** existing row(s) and append "
-    f"**{accepted_new}** new row(s)."
+    f"Ready to fill **{accepted_fills}** existing row(s) and add "
+    f"**{accepted_new}** new row(s) "
+    f"({accepted_grouped} grouped under an existing patient, "
+    f"{accepted_new - accepted_grouped} appended at the bottom)."
 )
 
 if st.button("✅ Confirm & generate file", type="primary", disabled=not (accepted_fills or accepted_new)):
@@ -370,7 +386,8 @@ if generated:
     payload, stats = generated
     st.success(
         f"Wrote {stats['filled_cells']} cell(s) across {stats['filled_rows']} existing "
-        f"row(s) and appended {stats['appended_rows']} new row(s). "
+        f"row(s), inserted {stats['inserted_rows']} new row(s) under their patient "
+        f"and appended {stats['appended_rows']} at the bottom. "
         "Every other sheet, formula and format is preserved."
     )
     if stats["skipped_non_blank"]:

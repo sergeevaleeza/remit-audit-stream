@@ -27,6 +27,10 @@ needs the result to be auditable rather than fast.
 - **New names written in the sheet's style.** A row the app appends stores
   `Marchetti, Dean`, not Medicare's `MARCHETTI, DEAN`. Existing names are never
   rewritten.
+- **New rows group under their patient.** A new visit for someone already in
+  the schedule is inserted directly beneath that person's existing rows, so
+  each patient stays together. Patients not in the schedule are appended at the
+  bottom.
 - **Optional DX reference.** Upload `List_of_Patients_Mutual.xlsx` and the app
   fills blank `DX` cells from it. Without it, `DX` is left blank as before.
 - **Audit trail.** Rows the app creates or fills are stamped with
@@ -132,6 +136,33 @@ than guessing; a patient listed twice with different codes uses the first and
 flags the conflict in the preview; a low-confidence name match is flagged
 *Needs review* and leaves `DX` blank.
 
+### Where new rows go
+
+New rows are no longer always appended. Placement is decided per patient, using
+the same suffix-aware name matching as everything else:
+
+- **Patient already in the schedule** → the new row is **inserted directly
+  below that patient's last existing row**, so their visits stay grouped. If a
+  patient's rows are scattered, the *last* occurrence is the anchor. Several
+  new visits for one patient go in as a single block in `Data` order.
+- **Patient not in the schedule** → appended at the **bottom**, as before.
+
+*Fill existing row* cases never move — only genuinely new rows are placed.
+
+Mid-sheet insertion is the delicate part, so the implementation is deliberate
+about it: all placements are computed against the **original** layout, then
+inserts are applied **bottom-up** (highest anchor first) so an insertion lower
+down cannot shift an anchor still to be processed. Bottom appends happen last,
+against the final layout. Inserted cells copy the anchor row's font, fill,
+border, alignment and number format, since `insert_rows` leaves new cells
+unstyled.
+
+`insert_rows` also does **not** adjust merged ranges, formulas, conditional
+formatting or data validations. So before inserting, the app checks whether the
+anchor is safe — if inserting would split a **merged region**, or if the row
+just below the anchor looks like a **totals/summary row**, that patient's new
+rows are appended at the bottom instead and the preview says why.
+
 ### Audit columns
 
 The app maintains two columns of its own, created on first use in the first
@@ -213,7 +244,8 @@ matching **patient name** and the same **parsed calendar date** in `Data`, then:
 |---|---|
 | Match found, `Payment` empty | **Fill existing row N** — writes only the blank cells among `Billed`, `Payment`, `Co-pay`, `Comment`, `DX` |
 | Match found, `Payment` holds any value | **Skip (already paid)** |
-| No match | **New row** appended after the last data row |
+| No match, patient already in the sheet | **New row** inserted under that patient's existing rows |
+| No match, patient not in the sheet | **New row** appended at the bottom |
 | Low-confidence name, unknown NPI, ambiguous multi-match, or ambiguous DX name | **Needs review** — never auto-applied |
 
 - **The dedup key is Patient + Data + CPT.** A payment is considered already
@@ -236,8 +268,10 @@ matching **patient name** and the same **parsed calendar date** in `Data`, then:
 - When several rows share a patient and date (e.g. two providers), the app
   disambiguates by CPT overlap, then by the provider `Comment`, then by which
   row is still unpaid. If the tie survives all three it is flagged for review.
-- New rows are appended after the last data row; existing rows are never
-  re-sorted.
+- New rows are grouped under their patient where that patient already exists,
+  and appended at the bottom otherwise (see *Where new rows go*). Existing rows
+  are never re-sorted, edited beyond their fill cells, or moved relative to one
+  another — they only shift down to make room for an insertion.
 
 ---
 

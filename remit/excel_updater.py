@@ -197,6 +197,78 @@ def ensure_audit_columns(worksheet: Worksheet,
     return resolved
 
 
+#: Text that marks a row as a totals/summary structure rather than patient data.
+_SUMMARY_RE = re.compile(r"\b(total|totals|subtotal|sum|grand\s+total)\b", re.IGNORECASE)
+
+
+def _row_is_summary_like(worksheet: Worksheet, columns: dict[str, int], row: int) -> bool:
+    """A row with no patient but other content, or one saying 'total'."""
+    if row > worksheet.max_row:
+        return False
+
+    patient_blank = is_blank(worksheet.cell(row=row, column=columns[COL_PATIENT]).value)
+    has_content = False
+    for column in range(1, worksheet.max_column + 1):
+        value = worksheet.cell(row=row, column=column).value
+        if is_blank(value):
+            continue
+        has_content = True
+        if isinstance(value, str) and _SUMMARY_RE.search(value):
+            return True
+    return patient_blank and has_content
+
+
+def insertion_blocked_reason(worksheet: Worksheet, columns: dict[str, int],
+                             anchor: int) -> str | None:
+    """Why inserting directly below `anchor` would be unsafe, or None.
+
+    `insert_rows` does not adjust merged ranges, so splitting one would
+    corrupt the sheet; and inserting above a totals row would silently put
+    data outside whatever that row summarises. In either case the caller
+    appends at the bottom instead.
+    """
+    for merged in worksheet.merged_cells.ranges:
+        if merged.min_row <= anchor + 1 and merged.max_row >= anchor:
+            return f"would split merged cells {merged.coord}"
+
+    if _row_is_summary_like(worksheet, columns, anchor + 1):
+        return f"row {anchor + 1} looks like a totals/summary row"
+
+    return None
+
+
+def annotate_placement(worksheet: Worksheet, columns: dict[str, int],
+                       changes: Sequence[Change]) -> None:
+    """Mark new rows whose anchor is unsafe, so the preview can say so."""
+    for change in changes:
+        if change.effective_action != ACTION_NEW or change.anchor_row is None:
+            continue
+        change.placement_fallback = (
+            insertion_blocked_reason(worksheet, columns, change.anchor_row) or ""
+        )
+
+
+def _write_new_row(worksheet: Worksheet, columns: dict[str, int],
+                   row: int, style_row: int, change: Change) -> None:
+    """Fill one blank row with a change's values, styled like `style_row`."""
+    values = new_row_values(
+        change.visit,
+        dx=change.dx_value,
+        processed_on=change.processed_on,
+        check_eft=change.check_eft_display,
+    )
+    for header, column in columns.items():
+        if header in NEVER_TOUCH_COLUMNS:
+            continue
+        target = worksheet.cell(row=row, column=column)
+        if style_row >= DATA_START_ROW:
+            _copy_style(worksheet.cell(row=style_row, column=column), target)
+        value = values.get(header)
+        # DX is absent from values unless the Mutual file supplied one.
+        if value not in (None, ""):
+            target.value = value
+
+
 def _stamp_audit(worksheet: Worksheet, columns: dict[str, int],
                  row_num: int, change: Change) -> None:
     """Write this run's audit stamps onto a row the app created or filled.
@@ -257,34 +329,54 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
             filled_rows += 1
             _stamp_audit(worksheet, columns, change.row_num, change)
 
-    template_row = last_data_row(worksheet, columns)
-    next_row = template_row + 1
-    for change in applies:
-        if change.effective_action != ACTION_NEW:
+    # --- New rows ----------------------------------------------------------
+    # Placement is decided against the ORIGINAL layout (fills above have not
+    # moved any row), then applied bottom-up so that inserting lower down
+    # cannot shift an anchor that is still to be processed.
+    new_changes = [c for c in applies if c.effective_action == ACTION_NEW]
+
+    grouped: dict[int, list[Change]] = {}
+    to_append: list[Change] = []
+    for change in new_changes:
+        anchor = change.anchor_row
+        if anchor is None:
+            to_append.append(change)
             continue
-        values = new_row_values(
-            change.visit,
-            dx=change.dx_value,
-            processed_on=change.processed_on,
-            check_eft=change.check_eft_display,
-        )
-        for header, column in columns.items():
-            if header in NEVER_TOUCH_COLUMNS:
-                continue
-            target = worksheet.cell(row=next_row, column=column)
-            if template_row >= DATA_START_ROW:
-                _copy_style(worksheet.cell(row=template_row, column=column), target)
-            value = values.get(header)
-            # DX is absent from values unless the Mutual file supplied one.
-            if value not in (None, ""):
-                target.value = value
-        appended_rows += 1
-        next_row += 1
+        blocked = insertion_blocked_reason(worksheet, columns, anchor)
+        if blocked:
+            change.placement_fallback = blocked
+            to_append.append(change)
+            continue
+        change.placement_fallback = ""
+        grouped.setdefault(anchor, []).append(change)
+
+    inserted_rows = 0
+    for anchor in sorted(grouped, reverse=True):
+        block = sorted(grouped[anchor], key=lambda c: c.visit.service_date)
+        worksheet.insert_rows(anchor + 1, len(block))
+        for offset, change in enumerate(block):
+            row = anchor + 1 + offset
+            # insert_rows leaves the new cells unstyled; match the anchor row
+            # so the inserted rows look like the rest of that patient's block.
+            _write_new_row(worksheet, columns, row, anchor, change)
+            inserted_rows += 1
+
+    # Bottom appends go last, against the final layout.
+    appended_rows = 0
+    if to_append:
+        template_row = last_data_row(worksheet, columns)
+        next_row = template_row + 1
+        for change in sorted(to_append, key=lambda c: (c.visit.patient, c.visit.service_date)):
+            _write_new_row(worksheet, columns, next_row, template_row, change)
+            appended_rows += 1
+            next_row += 1
 
     return {
         "filled_rows": filled_rows,
         "filled_cells": filled_cells,
+        "inserted_rows": inserted_rows,
         "appended_rows": appended_rows,
+        "new_rows": inserted_rows + appended_rows,
         "skipped_non_blank": skipped_non_blank,
     }
 

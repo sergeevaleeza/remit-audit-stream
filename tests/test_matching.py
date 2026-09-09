@@ -40,7 +40,7 @@ from remit.matching import (
     summarize,
 )
 
-from .conftest import find_visit
+from .conftest import find_row, find_visit
 
 
 @pytest.fixture()
@@ -238,11 +238,19 @@ def test_new_row_dates_are_written_as_text_not_serials(schedule_bytes, visits, s
 
 
 def test_new_rows_do_not_disturb_existing_rows(schedule_bytes, plan, schedule):
+    """Every original row survives with its values intact, wherever it moved."""
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
+
     assert worksheet.cell(row=3, column=1).value == "Marlowe, Diane"
-    last_existing = len(schedule[3]) + 2
-    assert worksheet.cell(row=last_existing, column=1).value == "Delacroix, Owen"
+
+    for original in schedule[3]:
+        found = find_row(worksheet, str(original.patient), original.data)
+        assert found["Patient"] == original.patient
+        assert found["CPT Code"] == original.cpt
+        # An untouched row keeps its exact Payment; a filled one gains a value.
+        if original.payment is not None:
+            assert found["Payment"] == original.payment
 
 
 # --- Name normalisation ----------------------------------------------------

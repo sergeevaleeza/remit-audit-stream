@@ -3,6 +3,65 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] — 2026-09-08
+
+New rows are grouped under their patient instead of always being appended.
+Only *where* new rows are written changed — fills, dedup/idempotency,
+never-overwrite, the `DX` / `Processed On` / `Remit Check/EFT #` logic and
+whole-workbook preservation are all unchanged. 197 tests pass (was 174).
+
+### Changed
+
+- **A new visit for a patient already in the schedule is inserted directly
+  below that patient's last existing row**, so each person's rows stay
+  together. Patients absent from the schedule are still appended at the bottom.
+  *Fill existing row* cases are unaffected — only genuinely new rows move.
+- Placement uses the same suffix-aware, normalised name matching as everything
+  else, so a new `MARCHETTI, DEAN` visit groups under `Marchetti Jr, Dean`.
+  Non-contiguous patient rows anchor on the **last** occurrence, and several
+  new visits for one patient insert as a single block in `Data` order.
+- `apply_changes` now returns `inserted_rows` and `new_rows` alongside the
+  existing `appended_rows`, which now counts only bottom appends.
+
+### Added
+
+- `find_patient_anchor()` in `remit/matching.py`, plus `anchor_row`,
+  `anchor_patient` and `placement_fallback` on `Change`, with a
+  `placement_display` property for the preview
+  (`under existing "Name"` vs `appended (patient not in schedule)`).
+- `insertion_blocked_reason()` and `annotate_placement()` in
+  `remit/excel_updater.py` — structural safety checks described below.
+- A **Placement** column in the preview table, and a confirm line that splits
+  the count into rows grouped under a patient vs appended at the bottom.
+- `tests/test_row_placement.py` (23 tests) covering anchor selection, grouped
+  insertion, date-ordered blocks, the suffix case, bottom appends, styling
+  inheritance, merged-cell and totals-row fallbacks, row-count integrity, and
+  idempotency over an already-grouped sheet.
+- `sheet_rows()` and `find_row()` test helpers in `tests/conftest.py`: rows
+  move now, so tests locate them by identity rather than a fixed index.
+
+### Safety notes on mid-sheet insertion
+
+`openpyxl.insert_rows` is unforgiving, so the implementation is deliberate:
+
+- **All placements are computed against the original layout first**, then
+  applied. Fills are written before any insertion, using original row numbers.
+- **Inserts are applied bottom-up** (highest anchor first) via a single
+  `insert_rows(anchor + 1, count)` per anchor, so inserting lower down cannot
+  shift an anchor still to be processed. Bottom appends run last, against the
+  final layout.
+- `insert_rows` leaves new cells **unstyled**, so each inserted cell copies the
+  anchor row's font, fill, border, alignment and number format.
+- `insert_rows` does **not** adjust merged ranges, formulas, conditional
+  formatting, data validations or charts. Rather than risk corrupting a sheet,
+  the app refuses to insert when doing so would **split a merged region** or
+  place data **above a totals/summary row**; that patient's new rows are
+  appended at the bottom instead and the preview says why. The check runs
+  inside `apply_changes`, so correctness never depends on the preview
+  annotation.
+
+---
+
 ## [1.2.0] — 2026-09-08
 
 Four incremental changes to matching and output. All existing behaviour is
@@ -309,6 +368,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.3.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.3.0
 [1.2.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.2.0
 [1.1.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.1.0
 [1.0.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.0.0

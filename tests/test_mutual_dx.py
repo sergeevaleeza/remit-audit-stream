@@ -30,7 +30,7 @@ from remit.excel_updater import (
 from remit.matching import build_plan, plan_change
 from remit.mutual import build_dx_lookup, load_dx_lookup
 
-from .conftest import find_visit
+from .conftest import find_row, find_visit
 
 MUTUAL_XLSX = Path(__file__).parent / "fixtures" / "List_of_Patients_Mutual.xlsx"
 
@@ -213,10 +213,8 @@ def test_dx_is_written_to_the_workbook(schedule_bytes, visits, schedule_rows, dx
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
 
-    bystritskaya = next(
-        r for r in schedule_rows if str(r.patient).startswith("Bystritskaya")
-    )
-    assert worksheet.cell(row=bystritskaya.row_num, column=10).value == "F42.2"
+    # The row may have moved: new visits insert under their own patient.
+    assert find_row(worksheet, "Bystritskaya Jr, Anna")["DX"] == "F42.2"
 
 
 def test_new_row_dx_lands_in_the_dx_column(schedule_bytes, visits, schedule_rows, dx_lookup):
@@ -247,8 +245,11 @@ def test_without_mutual_behaviour_is_unchanged(schedule_bytes, visits, schedule_
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
 
-    for offset in range(len(schedule_rows) + 3, worksheet.max_row + 1):
-        assert worksheet.cell(row=offset, column=10).value is None
+    for change in plan:
+        if change.effective_action != ACTION_NEW or not change.accepted:
+            continue
+        row = find_row(worksheet, change.visit.patient, change.visit.data_str)
+        assert row["DX"] is None
 
 
 def test_dx_display_strings(visits, schedule_rows, dx_lookup):

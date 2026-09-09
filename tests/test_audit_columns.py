@@ -25,7 +25,7 @@ from remit.excel_updater import (
 )
 from remit.matching import build_plan, plan_change
 
-from .conftest import find_visit
+from .conftest import find_row, find_visit
 
 STAMP_DATE = date(2026, 9, 8)
 STAMPED = STAMP_DATE.strftime(DATE_FMT)
@@ -101,29 +101,34 @@ def test_filled_rows_are_stamped(applied):
         assert worksheet.cell(row=change.row_num, column=CHECK_EFT_COL).value == "900000001"
 
 
-def test_appended_rows_are_stamped(applied, schedule_rows):
-    worksheet, _, stats = applied
-    first_new = len(schedule_rows) + 3
-    for row in range(first_new, first_new + stats["appended_rows"]):
-        assert worksheet.cell(row=row, column=PROCESSED_ON_COL).value == STAMPED
-        assert worksheet.cell(row=row, column=CHECK_EFT_COL).value == "900000001"
+def test_new_rows_are_stamped(applied):
+    """Every new row -- inserted under a patient or appended -- is stamped."""
+    worksheet, plan, stats = applied
+    new_changes = [c for c in plan if c.accepted and c.effective_action == "New row"]
+    assert len(new_changes) == stats["new_rows"]
+
+    for change in new_changes:
+        row = find_row(worksheet, change.visit.patient, change.visit.data_str)
+        assert row[COL_PROCESSED_ON] == STAMPED
+        assert row[COL_CHECK_EFT] == "900000001"
 
 
-def test_skipped_rows_are_not_stamped(applied, schedule_rows, visits):
-    """Already-paid rows stay completely untouched."""
+def test_skipped_rows_are_not_stamped(applied):
+    """Already-paid rows stay completely untouched, wherever they moved to."""
     worksheet, plan, _ = applied
     skipped = [c for c in plan if c.action == "Skip (already paid)"]
     assert skipped
     for change in skipped:
-        assert worksheet.cell(row=change.row_num, column=PROCESSED_ON_COL).value is None
-        assert worksheet.cell(row=change.row_num, column=CHECK_EFT_COL).value is None
+        row = find_row(worksheet, change.visit.patient, change.visit.data_str)
+        assert row[COL_PROCESSED_ON] is None
+        assert row[COL_CHECK_EFT] is None
 
 
 def test_untouched_rows_are_not_stamped(applied, schedule_rows):
     """`Delacroix, Owen` is in the sheet but not the remit."""
     worksheet, _, _ = applied
-    delacroix = next(r for r in schedule_rows if str(r.patient).startswith("Delacroix"))
-    assert worksheet.cell(row=delacroix.row_num, column=PROCESSED_ON_COL).value is None
+    row = find_row(worksheet, "Delacroix, Owen")
+    assert row[COL_PROCESSED_ON] is None
 
 
 def test_stamp_uses_the_configured_date_format(applied):
