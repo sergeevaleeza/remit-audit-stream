@@ -18,10 +18,20 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
+from .fixtures.synthetic_employees_data import (
+    ANA_HEADERS,
+    ANA_ROWS,
+    MARCIA_HEADERS,
+    MARCIA_ROWS,
+    OXANA_HEADERS,
+    OXANA_ROWS,
+    OXANA_TITLE,
+)
 from .fixtures.synthetic_remit_data import MUTUAL_ROWS, SCHEDULE_ONLY_PATIENT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "List_of_Patients_Schedule.xlsx"
 MUTUAL_FIXTURE = Path(__file__).parent / "fixtures" / "List_of_Patients_Mutual.xlsx"
+EMPLOYEES_FIXTURE = Path(__file__).parent / "fixtures" / "AMSMC_employees_sample.xlsx"
 
 HEADERS = [
     "Patient", "Ins", "Data", "Billed", "Payment", "Co-pay",
@@ -37,8 +47,11 @@ DR_A = "Dr. A"
 # Patient, Ins, Data, Billed, Payment, Co-pay, Co-pays Paid, Office, Comment, DX, CPT
 ROWS = [
     # --- Already paid: must stay untouched (idempotency) --------------------
+    # This Comment names a provider *tab*, so the employees-file cross-check
+    # has something to fire on. A `Dr. …` comment names a physician, not a tab,
+    # and is deliberately not treated as a conflict.
     ["Marlowe, Diane", "Medicare", datetime(2026, 3, 9), "2/32/26",
-     166.37, "=23.52+18.92", None, None, DR_A, DX, "99213/90833"],
+     166.37, "=23.52+18.92", None, None, "Oxana", DX, "99213/90833"],
     ["Marlowe, Diane", "Medicare", "04/21/2026", datetime(2026, 6, 18),
      224.59, 57.29, None, None, None, DX, "99214/90836"],
     ["Thackeray, Renata", "Medicare", datetime(2026, 3, 20), "2/32/26",
@@ -136,12 +149,55 @@ def build_mutual() -> Workbook:
     return workbook
 
 
+def _write_employee_sheet(sheet, headers, rows, header_row: int) -> None:
+    """Lay out one provider tab: headers on `header_row`, data below."""
+    header_fill = PatternFill("solid", fgColor="E2EFDA")
+    for index, header in enumerate(headers, start=1):
+        cell = sheet.cell(row=header_row, column=index, value=header)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+
+    lookup = {h: i for i, h in enumerate(headers, start=1)}
+    for offset, (patient, session_date, prefilled) in enumerate(rows):
+        row = header_row + 1 + offset
+        sheet.cell(row=row, column=lookup[headers[0]], value=patient)
+        sheet.cell(row=row, column=lookup["Date of Session"], value=session_date)
+        for label, value in prefilled.items():
+            cell = sheet.cell(row=row, column=lookup[label], value=value)
+            cell.number_format = "0.00"
+
+
+def build_employees() -> Workbook:
+    """The synthetic `AMSMC_employees.xlsx`: three tabs, two header layouts."""
+    workbook = Workbook()
+
+    ana = workbook.active
+    ana.title = "Ana"
+    _write_employee_sheet(ana, ANA_HEADERS, ANA_ROWS, header_row=1)
+
+    marcia = workbook.create_sheet("Marcia")
+    _write_employee_sheet(marcia, MARCIA_HEADERS, MARCIA_ROWS, header_row=1)
+
+    # Oxana's sheet carries a title on row 1, so her headers sit on row 2.
+    oxana = workbook.create_sheet("Oxana")
+    oxana.cell(row=1, column=1, value=OXANA_TITLE).font = Font(bold=True, size=14)
+    _write_employee_sheet(oxana, OXANA_HEADERS, OXANA_ROWS, header_row=2)
+
+    # A sheet the app must ignore entirely.
+    notes = workbook.create_sheet("Notes")
+    notes["A1"] = "Not a provider tab"
+
+    return workbook
+
+
 def main() -> None:
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     build().save(FIXTURE)
     print(f"wrote {FIXTURE}")
     build_mutual().save(MUTUAL_FIXTURE)
     print(f"wrote {MUTUAL_FIXTURE}")
+    build_employees().save(EMPLOYEES_FIXTURE)
+    print(f"wrote {EMPLOYEES_FIXTURE}")
 
 
 if __name__ == "__main__":

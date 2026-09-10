@@ -3,6 +3,183 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.0] — 2026-09-10
+
+Adds the `AMSMC_employees.xlsx` workbook as a fourth upload and a second
+download, derives `Ins` from the remit's place of service, and hardens the
+running app against PHI leakage. 281 tests pass (was 241).
+
+### Added — place of service -> `Ins`
+
+- The parser now captures each service line's **POS** (the 2-digit token right
+  after the 6-digit service date) and its **modifiers** (anything between PROC
+  and the money columns), aggregated to the visit.
+- `pdf_parser.insurance_label(visit)` replaces the old "Ins is always
+  Medicare" constant: **POS `10` + modifier `95` -> `POS 10(95)`**, everything
+  else -> `Medicare`. New schedule rows take this value.
+- Existing rows already say `Medicare`; per never-overwrite they are left alone
+  and **flagged in the preview** when the EOB says the visit was telehealth.
+  `OVERWRITE_INS_FOR_TELEHEALTH = False` in `remit/config.py` flips that to an
+  actual cell update.
+
+### Added — the employees workbook
+
+- **Fourth upload** (`AMSMC_employees.xlsx`, optional) and a **second
+  download**, `AMSMC_employees_updated_YYYY-MM-DD.xlsx` — complete and
+  standalone, every sheet and format preserved.
+- New `remit/employees.py`. **The header row is not in the same place on every
+  sheet** (Ana and Marcia row 1, Oxana row 2), so it is located by scanning the
+  first rows for the expected labels; labels are matched case-insensitively
+  with internal whitespace collapsed, because the real file contains
+  `Co-payment   Old` and `Paid by Ins toAna`. Oxana's patient column is headed
+  `Patient`, the others `Patient Name`.
+- Per-provider payment column, as confirmed:
+  `{"Ana": "Paid by Ins toAna", "Oxana": "Paid by Insurance", "Marcia": "Paid by Insurance"}`.
+- Mapped columns: `Patient Name`/`Patient`, `Date of Session`, `Insurance`,
+  `Co-pay by EOB`, and the provider payment column. Everything else is left
+  blank, and a non-blank cell is never overwritten.
+- **Routing is by patient name + Date of Session, never by `Comment`** — the
+  tabs are staff-curated and are the source of truth. Existing rows are filled;
+  further sessions of a patient already in a tab are appended (**Ana and Oxana
+  only — Marcia's tab is fill-only**); a patient in no tab is listed as
+  *unassigned — needs manual placement* rather than guessed
+  (`FALLBACK_TO_COMMENT_FOR_NEW = False`).
+- Appended rows copy the last data row's font, fill, border, alignment and
+  number format. Dedup is by patient + Date of Session, so re-running adds
+  nothing.
+- Per-provider preview section, plus panels for telehealth/`Ins` mismatches and
+  unassigned visits.
+- `tests/test_employees.py` (40 tests) and a **synthetic**
+  `tests/fixtures/AMSMC_employees_sample.xlsx` reproducing all three layouts.
+
+### Changed — `Comment` cross-check is narrower than first specified
+
+The request called for flagging a matched row whenever the schedule `Comment`
+"names a different practitioner". Implemented literally that flags **every**
+row: `Comment` is derived from the remit's performing-provider NPI, so it holds
+a *physician's* name (`Dr. Levinson`, `Dr. A`) and almost never one of the three
+employee tab names.
+
+So a `Comment` is treated as a usable cross-check **only when it actually names
+a provider tab**. `Oxana` on a row in Ana's tab is a mismatch; `Dr. A` is not a
+conflict at all, because it carries no signal about which tab is correct. Blank
+`Comment` fills normally, as specified.
+
+### Added — app-wide HIPAA safeguards
+
+- All uploads and downloads stay in `BytesIO`; nothing is written to the server
+  filesystem or `/tmp`.
+- `safe_error()` shows the exception **type** and a generic instruction, never
+  the message — openpyxl and pdfplumber quote cell values in their errors.
+- `.streamlit/config.toml`: `[client] showErrorDetails = false` so tracebacks
+  are not rendered into the page, `[logger] level = "error"`, and
+  `[browser] gatherUsageStats = false`.
+- No PHI in module globals or `st.cache_resource`; no `persist="disk"` caching.
+  State lives in per-session `st.session_state`.
+- A **Clear all data** button wipes the session, and a banner states that files
+  are processed in-session and not stored server-side.
+- Download filenames contain only the workbook name and the date.
+- `.gitignore` now excludes `AMSMC_employees*.xlsx` (PHI), with an explicit
+  exception for the synthetic fixture.
+- New [`HIPAA.md`](HIPAA.md) documenting all of the above, the required
+  viewer-allowlist step, and the caveat that **Streamlit Community Cloud and
+  GitHub are not BAA-covered**, so real PHI on them is a gap that code cannot
+  close.
+
+---
+
+## [1.4.0] — 2026-09-10
+
+Reconciles a second (or later) EOB for a visit that is already recorded.
+Previously such a visit was classified *Skip (already paid)* and a real payment
+was lost — the classic case being a first remittance paying `$0.00` and a later
+one that actually pays. 241 tests pass (was 197).
+
+### Added
+
+- **`Updated (adjusted EOB)`**, a fourth action alongside *Fill*, *Skip* and
+  *New row*. When a remit visit matches a recorded row on patient + service
+  date but reports different amounts, it is now reconciled instead of skipped:
+  - `Payment` and `Co-pay` are set to the later remit's values.
+  - `Billed` is set to the later remit's header `DATE:`.
+  - `Remit Check/EFT #` **appends** the new number to the existing value
+    (joined with `; `), so the payment history stays visible on the row.
+  - `Processed On` is stamped with today.
+  - Applied only on confirm, and only for a change the user left accepted.
+- **`REPROCESS_POLICY`** in `remit/config.py`, defaulting to
+  `replace_with_latest`: a later Medicare remit *restates* the claim, so the
+  recorded amount is replaced, **never summed**. `sum` and `flag_only` ship as
+  alternatives but are not the default.
+- Preview columns showing **old → new** for `Payment`, `Co-pay`, `Billed` and
+  `Remit Check/EFT #`, plus a `Why` column carrying a plain-language note such
+  as `was $0.00, now $130.46 (payment received)`. The summary line and metric
+  row gained an *Updated* count.
+- `remit.matching.reconcile_recorded_row()`, the single place that decides
+  skip vs. update vs. review for a row that already has a `Payment`, plus
+  `as_number()` / `amounts_differ()` helpers and `Change.updates`,
+  `Change.previous`, `Change.update_notes`, `Change.change_display()`.
+- `apply_changes` returns `updated_rows` and `updated_cells`.
+- `tests/test_adjusted_eob.py` (44 tests) covering the headline `0.00 → paid`
+  case, identical re-reports, out-of-order remits, unreadable recorded values,
+  CPT changes, multi-remit reconciliation and the no-duplicate-row guarantee.
+
+### Changed
+
+- **Amounts are no longer summed across remittances.** `aggregate_visits` now
+  aggregates service lines *within* each remittance, then reconciles across
+  remittances by taking the newest (by header `DATE:`). Previously two remits
+  covering one visit had their amounts added together, which under
+  `replace_with_latest` would have been wrong. Summing within a single
+  remittance — the E/M line plus its psychotherapy add-on — is unchanged.
+- `Visit` gained `remit_count`, `superseded_payments` and `restated`; a visit
+  fed by several remits notes in the preview how many contributed.
+- Several contributing remits no longer force *Needs review* on their own.
+  That flag existed as a safety net for the old summing behaviour; the case now
+  has defined semantics and is reported as a note instead.
+- `ScheduleRow` reads back the `Processed On` / `Remit Check/EFT #` columns so
+  a restatement can append to the check history rather than replace it.
+- Sidebar and duplicate-remit warning text updated: the never-overwrite rule
+  now has one stated, always-confirmed exception.
+- `test_zero_payment_counts_as_recorded` became
+  `test_zero_payment_is_never_treated_as_fillable`, and
+  `test_zero_payment_survives_the_write` became
+  `test_zero_payment_survives_when_the_remit_agrees`. Both encoded the old
+  behaviour where a `0.00` row was skipped outright. The underlying guarantee
+  is unchanged and still tested: `0.00` is never a *blank*, so it is never
+  *filled* — it is now *restated* when a later remit disagrees.
+
+### Safety rules
+
+- **Order matters.** An update happens only when the incoming remit is newer
+  than the recorded `Billed`. An older remit arriving out of order never
+  downgrades a newer value — *Needs review*, nothing changed. When the recorded
+  `Billed` is an unparseable placeholder (`2/32/26`) the order cannot be
+  verified, so the update is proposed with that stated in the preview.
+- **Never a second row.** A restatement always targets the matched row. A
+  changed CPT set is still the same visit: flagged *Needs review*, and if
+  accepted it updates that row rather than appending a duplicate.
+- **Unreadable values are never clobbered.** A recorded `Payment` that is a
+  formula or free text cannot be compared, so the row is flagged for review
+  rather than overwritten — which also keeps formula cells intact.
+- **Idempotent.** Once applied, the row agrees with the remit and reclassifies
+  as *Skip — already recorded*; re-running writes nothing.
+
+### Not implemented — employees-file propagation
+
+The request also asked to propagate confirmed updates to an employees workbook
+(the Ana/Oxana/Marcia tabs, matching on patient + `Date of Session` and writing
+`Paid by Insurance` / `Paid by Ins toAna`). **That feature does not exist in
+this repository** — there is no employees upload, sheet handling, or any
+reference to those tabs or columns anywhere in the code or git history, so
+there was nothing to extend. It was left unbuilt rather than invented against
+guessed sheet names and a guessed column layout.
+
+The groundwork is in place: every confirmed restatement carries its old and new
+`Payment` / `Co-pay` on `Change.updates` and `Change.previous`, so wiring a
+second workbook to those values is additive once its real format is known.
+
+---
+
 ## [1.3.0] — 2026-09-08
 
 New rows are grouped under their patient instead of always being appended.
@@ -368,6 +545,8 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.5.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.0
+[1.4.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.4.0
 [1.3.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.3.0
 [1.2.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.2.0
 [1.1.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.1.0

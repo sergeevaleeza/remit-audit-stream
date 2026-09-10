@@ -25,12 +25,16 @@ from .config import (
     ACTION_NEW,
     ACTION_REVIEW,
     ACTION_SKIP,
+    ACTION_UPDATE,
+    AMOUNT_TOLERANCE,
     CHECK_EFT_JOINER,
     COL_BILLED,
+    COL_CHECK_EFT,
     COL_COMMENT,
     COL_COPAY,
     COL_DX,
     COL_PAYMENT,
+    COL_PROCESSED_ON,
     DATE_FMT,
     DX_AMBIGUOUS,
     DX_CONFLICT,
@@ -41,6 +45,10 @@ from .config import (
     GENERATIONAL_SUFFIXES,
     NAME_AUTO_MATCH_SCORE,
     NAME_REVIEW_MIN_SCORE,
+    OVERWRITE_INS_FOR_TELEHEALTH,
+    REPROCESS_FLAG_ONLY,
+    REPROCESS_POLICY,
+    REPROCESS_SUM,
 )
 from .pdf_parser import Visit, order_cpt_codes
 
@@ -291,6 +299,10 @@ class ScheduleRow:
     comment: Any = None
     dx: Any = None
     cpt: Any = None
+    #: The app's own audit columns, read back so a restatement can append to
+    #: the check/EFT history rather than replacing it.
+    processed_on: Any = None
+    check_eft: Any = None
 
     @property
     def data_date(self) -> date | None:
@@ -340,6 +352,20 @@ class Change:
     #: Set when a structurally unsafe anchor forced a bottom append instead.
     placement_fallback: str = ""
 
+    #: Cells an accepted `Updated (adjusted EOB)` change would OVERWRITE, and
+    #: the values they hold today. Unlike `fills`, these target populated
+    #: cells, so they are only ever written for an accepted update.
+    updates: dict[str, Any] = field(default_factory=dict)
+    previous: dict[str, Any] = field(default_factory=dict)
+    #: Plain-language notes about the restatement, shown in the preview.
+    update_notes: list[str] = field(default_factory=list)
+
+    #: Set when the EOB says telehealth but the matched row's `Ins` does not.
+    #: Surfaced in the preview; the cell itself is only rewritten when
+    #: OVERWRITE_INS_FOR_TELEHEALTH is on, via `ins_update`.
+    telehealth_mismatch: str = ""
+    ins_update: str = ""
+
     @property
     def needs_review(self) -> bool:
         return self.action == ACTION_REVIEW
@@ -381,13 +407,35 @@ class Change:
         """
         if self.action != ACTION_REVIEW:
             return self.action
+        if self.row_num and self.updates:
+            return ACTION_UPDATE
         return ACTION_FILL if self.row_num and self.fills else ACTION_NEW
 
     @property
     def action_label(self) -> str:
         if self.action == ACTION_FILL and self.row_num:
             return f"{ACTION_FILL} {self.row_num}"
+        if self.action == ACTION_UPDATE and self.row_num:
+            return f"{ACTION_UPDATE} - row {self.row_num}"
         return self.action
+
+    @property
+    def is_update(self) -> bool:
+        """True when applying this would overwrite a recorded amount."""
+        return bool(self.updates)
+
+    def change_display(self, column: str) -> str:
+        """`old -> new` for one column, or blank when it is not changing."""
+        if column not in self.updates:
+            return ""
+        before = self.previous.get(column)
+        before_text = "(blank)" if is_blank(before) else str(before)
+        return f"{before_text} -> {self.updates[column]}"
+
+    @property
+    def update_summary(self) -> str:
+        """The preview's one-line explanation of a restatement."""
+        return "; ".join(self.update_notes)
 
 
 def _candidate_rows(visit: Visit, rows: Sequence[ScheduleRow]) -> list[tuple[ScheduleRow, float]]:
@@ -471,6 +519,193 @@ def _fill_values(visit: Visit, row: ScheduleRow,
     return fills
 
 
+def as_number(value: Any) -> float | None:
+    """A cell's numeric value, or None when it cannot be read as one.
+
+    Formula strings such as ``=23.52+18.92`` are stored, not evaluated, by
+    openpyxl, so they come back as text and cannot be compared numerically.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text or text.startswith("="):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def amounts_differ(recorded: Any, incoming: float) -> bool:
+    """True when a recorded cell disagrees with the remit's amount."""
+    number = as_number(recorded)
+    if number is None:
+        return False  # unreadable: handled separately, never treated as a diff
+    return abs(number - incoming) > AMOUNT_TOLERANCE
+
+
+def _money(value: Any) -> str:
+    number = as_number(value)
+    return f"${number:,.2f}" if number is not None else f"{value}"
+
+
+def _append_check_eft(existing: Any, incoming: str) -> str:
+    """Append this remit's check number, keeping the earlier ones visible."""
+    seen: list[str] = []
+    for part in str(existing or "").split(CHECK_EFT_JOINER.strip()):
+        cleaned = part.strip()
+        if cleaned and cleaned not in seen:
+            seen.append(cleaned)
+    for part in incoming.split(CHECK_EFT_JOINER.strip()):
+        cleaned = part.strip()
+        if cleaned and cleaned not in seen:
+            seen.append(cleaned)
+    return CHECK_EFT_JOINER.join(seen)
+
+
+def reconcile_recorded_row(visit: Visit, row: ScheduleRow, processed_on: str,
+                           check_eft_display: str) -> tuple[str, dict, dict, list[str], list[str]]:
+    """Compare a remit visit against a row that already has a Payment.
+
+    Returns ``(action, updates, previous, notes, review_reasons)``. The visit
+    and the row are already known to be the same patient and service date, so
+    this only decides whether the amounts agree, whether the remit is newer,
+    and what an accepted update would overwrite.
+    """
+    notes: list[str] = []
+    reasons: list[str] = []
+
+    recorded_payment = as_number(row.payment)
+    if recorded_payment is None:
+        # A formula or free text: we cannot tell whether it agrees, and
+        # overwriting it would destroy the formula. Always ask.
+        reasons.append(
+            f"Recorded Payment {row.payment!r} is not a plain number, so it "
+            f"cannot be compared with the remit's {_money(visit.payment)} - "
+            "check this row by hand"
+        )
+        return ACTION_REVIEW, {}, {}, notes, reasons
+
+    payment_differs = amounts_differ(row.payment, visit.payment)
+    copay_differs = amounts_differ(row.copay, visit.copay)
+
+    if not payment_differs and not copay_differs:
+        return ACTION_SKIP, {}, {}, notes, reasons
+
+    # --- The amounts disagree, so this is a restatement --------------------
+    recorded_billed = parse_loose_date(row.billed)
+    incoming_billed = visit.billed_date
+
+    if (recorded_billed is not None and incoming_billed is not None
+            and incoming_billed < recorded_billed):
+        reasons.append(
+            f"Out-of-order remit: this remittance is dated "
+            f"{incoming_billed.strftime(DATE_FMT)} but the row already records "
+            f"{recorded_billed.strftime(DATE_FMT)}. The newer value "
+            f"({_money(row.payment)}) is kept; nothing is changed."
+        )
+        return ACTION_REVIEW, {}, {}, notes, reasons
+
+    if REPROCESS_POLICY == REPROCESS_FLAG_ONLY:
+        reasons.append(
+            f"Adjusted EOB: recorded {_money(row.payment)}, remit reports "
+            f"{_money(visit.payment)}. Policy is flag-only, so nothing is changed."
+        )
+        return ACTION_REVIEW, {}, {}, notes, reasons
+
+    if REPROCESS_POLICY == REPROCESS_SUM:
+        new_payment = round((recorded_payment or 0.0) + visit.payment, 2)
+        new_copay = round((as_number(row.copay) or 0.0) + visit.copay, 2)
+        notes.append(
+            f"Policy '{REPROCESS_SUM}': added to the recorded amount "
+            f"({_money(row.payment)} + {_money(visit.payment)})"
+        )
+    else:
+        new_payment = visit.payment
+        new_copay = visit.copay
+
+    updates: dict[str, Any] = {
+        COL_PAYMENT: new_payment,
+        COL_COPAY: new_copay,
+        COL_PROCESSED_ON: processed_on,
+    }
+    previous: dict[str, Any] = {
+        COL_PAYMENT: row.payment,
+        COL_COPAY: row.copay,
+        COL_PROCESSED_ON: None,
+    }
+
+    if visit.billed_str:
+        updates[COL_BILLED] = visit.billed_str
+        previous[COL_BILLED] = row.billed
+
+    if check_eft_display:
+        merged_eft = _append_check_eft(row.check_eft, check_eft_display)
+        if merged_eft != str(row.check_eft or ""):
+            updates[COL_CHECK_EFT] = merged_eft
+            previous[COL_CHECK_EFT] = row.check_eft
+
+    # The headline case: a zero-dollar first EOB later actually pays.
+    if recorded_payment == 0 and visit.payment > 0:
+        notes.append(
+            f"was $0.00, now {_money(visit.payment)} (payment received)"
+        )
+    elif payment_differs:
+        notes.append(
+            f"Payment {_money(row.payment)} -> {_money(visit.payment)}"
+        )
+    if copay_differs:
+        notes.append(f"Co-pay {_money(row.copay)} -> {_money(visit.copay)}")
+
+    if recorded_billed is None and not is_blank(row.billed):
+        notes.append(
+            f"recorded Billed {row.billed!r} is not a usable date, so the "
+            "remit order could not be verified"
+        )
+
+    # A changed CPT set still means the same visit -- never a second row --
+    # but it is worth a human look before the amounts are restated.
+    row_cpts = row.cpt_codes
+    visit_cpts = set(visit.cpt_codes)
+    if row_cpts and visit_cpts and row_cpts != visit_cpts:
+        reasons.append(
+            f"CPT set changed: sheet has {'/'.join(order_cpt_codes(row_cpts))}, "
+            f"remit reports {visit.cpt_display}. The row is still treated as "
+            "the same visit (no duplicate row is created)."
+        )
+        return ACTION_REVIEW, updates, previous, notes, reasons
+
+    if visit.restated:
+        notes.append(
+            f"{visit.remit_count} remits in this upload reported this visit; "
+            "the newest supplies the amounts"
+        )
+
+    return ACTION_UPDATE, updates, previous, notes, reasons
+
+
+def telehealth_flag(visit: Visit, row: ScheduleRow) -> tuple[str, str]:
+    """(preview message, `Ins` value to write) when the row disagrees.
+
+    Existing rows almost always say `Medicare`; if the EOB shows the visit was
+    telehealth the row is out of date. Per never-overwrite the cell is left
+    alone and merely flagged, unless OVERWRITE_INS_FOR_TELEHEALTH is on.
+    """
+    if not visit.telehealth or is_blank(row.ins):
+        return "", ""
+    if _normalize_token(row.ins) == _normalize_token(visit.insurance):
+        return "", ""
+    message = (
+        f"EOB says telehealth (POS 10 + 95) but row {row.row_num} has "
+        f"Ins = {row.ins!r}. Expected {visit.insurance!r}"
+    )
+    if OVERWRITE_INS_FOR_TELEHEALTH:
+        return message + " - will be updated", visit.insurance
+    return message + " - left as-is, fix by hand", ""
+
+
 def find_patient_anchor(visit: Visit,
                         rows: Sequence[ScheduleRow]) -> tuple[int | None, str | None]:
     """The last existing row belonging to this visit's patient, if any.
@@ -532,6 +767,8 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
     if dx_reason:
         review_reasons.append(dx_reason)
 
+
+
     anchor_row, anchor_patient = find_patient_anchor(visit, rows)
 
     audit = dict(
@@ -581,6 +818,10 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
 
     row, score = chosen
 
+    telehealth_message, ins_update = telehealth_flag(visit, row)
+    audit["telehealth_mismatch"] = telehealth_message
+    audit["ins_update"] = ins_update
+
     if score < NAME_AUTO_MATCH_SCORE:
         review_reasons.append(
             f"Low-confidence name match ({score:.0f}%): "
@@ -588,16 +829,39 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
         )
 
     if row.payment_recorded:
-        # Already recorded: this row is left completely untouched, so no DX
-        # fill and no audit stamp.
+        # A Payment is already on the row. Either the remit agrees (a true
+        # duplicate -> skip, untouched) or it restates the claim, which is an
+        # update the user has to confirm. Either way this is the same visit,
+        # so a second row is never created.
+        recorded_action, updates, previous, notes, recorded_reasons = reconcile_recorded_row(
+            visit, row, audit["processed_on"], audit["check_eft_display"],
+        )
+        review_reasons.extend(recorded_reasons)
+
+        if recorded_action == ACTION_SKIP and not review_reasons:
+            return Change(
+                visit=visit,
+                action=ACTION_SKIP,
+                row_num=row.row_num,
+                existing_billed=row.billed,
+                score=score,
+                review_reasons=[],
+                accepted=False,
+                **audit,
+            )
+
+        needs_review = recorded_action == ACTION_REVIEW or bool(review_reasons)
         return Change(
             visit=visit,
-            action=ACTION_SKIP,
+            action=ACTION_REVIEW if needs_review else ACTION_UPDATE,
             row_num=row.row_num,
             existing_billed=row.billed,
             score=score,
-            review_reasons=[],
-            accepted=False,
+            review_reasons=review_reasons,
+            accepted=not needs_review,
+            updates=updates,
+            previous=previous,
+            update_notes=notes,
             **audit,
         )
 
@@ -671,6 +935,7 @@ def summarize(changes: Sequence[Change]) -> dict[str, int]:
         "fill": sum(1 for c in changes if c.action == ACTION_FILL),
         "new": sum(1 for c in changes if c.action == ACTION_NEW),
         "skip": sum(1 for c in changes if c.action == ACTION_SKIP),
+        "update": sum(1 for c in changes if c.action == ACTION_UPDATE),
         "review": sum(1 for c in changes if c.action == ACTION_REVIEW),
     }
 
@@ -690,12 +955,12 @@ def new_row_values(visit: Visit, dx: str | None = None,
         COL_INS,
         COL_PATIENT,
         COL_PROCESSED_ON,
-        INSURANCE_VALUE,
     )
 
     values = {
         COL_PATIENT: to_title_name(visit.patient),
-        COL_INS: INSURANCE_VALUE,
+        # `Medicare`, or `POS 10(95)` when the EOB says telehealth.
+        COL_INS: visit.insurance,
         COL_DATA: visit.data_str,
         COL_BILLED: visit.billed_str,
         COL_PAYMENT: visit.payment,

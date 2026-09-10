@@ -33,11 +33,24 @@ needs the result to be auditable rather than fast.
   bottom.
 - **Optional DX reference.** Upload `List_of_Patients_Mutual.xlsx` and the app
   fills blank `DX` cells from it. Without it, `DX` is left blank as before.
+- **Optional employees workbook.** Upload `AMSMC_employees.xlsx` and the app
+  fills the Ana / Marcia / Oxana tabs from the reconciled schedule and hands
+  back a second download. Also optional — without it nothing changes.
+- **Telehealth is called out.** `Ins` is derived per visit from the remit's
+  place of service: `POS 10(95)` for a telehealth encounter, `Medicare`
+  otherwise.
 - **Audit trail.** Rows the app creates or fills are stamped with
   `Processed On` and the `Remit Check/EFT #` that produced them.
+- **Adjusted EOBs are reconciled, not lost.** When a later remittance restates
+  a visit that is already recorded — classically a first EOB paying `$0.00` and
+  a later one that actually pays — it is surfaced as
+  **Updated (adjusted EOB)** with old → new values, instead of being skipped.
+  Amounts are replaced by the newest remit, never summed.
 - **Only fills blank cells, never overwrites.** This is the core safety
   guarantee. A cell that already holds *any* value is left exactly as it was.
   Every write is re-checked against the live cell immediately before it happens.
+  The single exception is a confirmed adjusted-EOB restatement, which always
+  shows you old → new first.
 - **Dedup / idempotency.** Re-running the same remittance against an
   already-updated schedule is a no-op.
 - **Messy-date tolerant.** `Data` and `Billed` are hand-typed free text holding
@@ -46,7 +59,8 @@ needs the result to be auditable rather than fast.
 - **Preserves the whole workbook.** openpyxl is used directly for both read and
   write, so all 24 sheets, styling and formulas survive into the download.
 - **Duplicate-remit warning.** If the same `CHECK/EFT #` appears in two uploaded
-  files, you get a warning instead of silently doubled amounts.
+  files, you get a warning. An identical re-report of a visit is recognised and
+  skipped rather than re-applied.
 
 ---
 
@@ -73,10 +87,11 @@ and so are skipped automatically.
 | Excel column | Source |
 |---|---|
 | `Patient` | the name between `NAME` and `MID` on the claim header |
-| `Ins` | literal `Medicare` |
+| *(POS / modifiers)* | the 2-digit token after the service date, and any token between PROC and the money columns |
+| `Ins` | `Medicare`, or `POS 10(95)` when POS is 10 **and** modifier 95 is present |
 | `Data` | SERV DATE — the `MMDDYY` token → `MM/DD/YYYY` |
 | `Billed` | the header `DATE:` value → `MM/DD/YYYY` |
-| `Payment` | **sum of PROV-PD** across the visit's service lines |
+| `Payment` | **sum of PROV-PD** across the visit's service lines *within one remit* |
 | `Co-pay` | **sum of COINS** (the 4th dollar amount) across those lines |
 | `Comment` | doctor resolved from the PERF-PROV NPI |
 | `CPT Code` | E/M code first, then the add-on, joined with `/` (new rows only) |
@@ -87,7 +102,9 @@ and so are skipped automatically.
 
 `PROV-PD` is already net of the CO-45 write-off and CO-253 sequestration, so it
 is taken as-is. Visits aggregate all service lines sharing
-**(patient, service date, provider NPI)**.
+**(patient, service date, provider NPI)**. That summing happens *within* a
+single remittance; across remittances the newest one replaces the older values
+rather than adding to them — see *Adjusted EOBs* below.
 
 ### NPI → doctor
 
@@ -135,6 +152,76 @@ Edge cases: a patient absent from the Mutual file leaves `DX` blank rather
 than guessing; a patient listed twice with different codes uses the first and
 flags the conflict in the preview; a low-confidence name match is flagged
 *Needs review* and leaves `DX` blank.
+
+### Place of service -> `Ins`
+
+Each service line carries a **POS** code (the 2-digit token right after the
+6-digit service date) and, for telehealth, a **`95`** modifier after the
+procedure code. Aggregated to the visit, they decide the `Ins` value:
+
+| Condition | `Ins` |
+|---|---|
+| POS `10` (patient's home) **and** modifier `95` | `POS 10(95)` |
+| anything else | `Medicare` |
+
+- **New schedule rows** get this value.
+- **Existing rows** already say `Medicare`. Per never-overwrite they are left
+  alone, but any row the EOB says was telehealth is **flagged in the preview**
+  so it can be corrected by hand. Set `OVERWRITE_INS_FOR_TELEHEALTH = True` in
+  `remit/config.py` to rewrite those specific cells instead.
+- The same value is written into the employees workbook's `Insurance` column.
+
+### Employees workbook (`AMSMC_employees.xlsx`)
+
+An **optional** fourth upload, producing a **second download**. One tab per
+practitioner, and the layout is not uniform:
+
+| Sheet | Header row | Patient column | Payment column |
+|---|---|---|---|
+| Ana | 1 | `Patient Name` | **`Paid by Ins toAna`** |
+| Marcia | 1 | `Patient Name` | `Paid by Insurance` |
+| Oxana | **2** | **`Patient`** | `Paid by Insurance` |
+
+Because the header row moves, it is **located by scanning the first rows for
+the expected labels** rather than assumed, and labels are matched
+case-insensitively with internal whitespace collapsed (the real file contains
+`Co-payment   Old` and `Paid by Ins toAna`).
+
+**Mapped columns**, from the matched schedule visit:
+
+| Employee column | Schedule source |
+|---|---|
+| `Patient Name` / `Patient` | `Patient` |
+| `Date of Session` | `Data` |
+| `Insurance` | `Medicare` / `POS 10(95)` |
+| `Co-pay by EOB` | `Co-pay` |
+| provider payment column | `Payment` |
+
+Everything else is left blank, and a non-blank cell is never overwritten.
+
+#### Which rows go where
+
+**The tabs are the source of truth for who belongs to whom** — staff curate
+them — so association is by **patient name + Date of Session**, never by the
+schedule's `Comment`.
+
+1. **Fill** every existing tab row that matches a schedule visit on name
+   (suffix-aware) and parsed date.
+2. **Cross-check `Comment`, secondarily.** If the matched schedule row's
+   `Comment` names a *different provider tab*, the row is flagged
+   **practitioner mismatch — needs review** instead of filled. A blank
+   `Comment`, or one naming a physician (`Dr. …`) rather than a tab, is **not**
+   a conflict — it carries no signal about which tab is right.
+3. **Append** a patient's further sessions to the tab they already appear in —
+   **Ana and Oxana only**. **Marcia's tab is fill-only and is never appended
+   to.** If a patient appears in several tabs, `Comment` routes them; if it
+   cannot, the visit is flagged.
+4. **Unassigned.** A visit for a patient in no tab is listed as
+   *unassigned — needs manual placement*, never guessed at. Set
+   `FALLBACK_TO_COMMENT_FOR_NEW = True` to append such patients to the tab
+   their `Comment` names.
+
+Dedup is by patient + Date of Session, so re-running adds nothing.
 
 ### Where new rows go
 
@@ -223,15 +310,22 @@ specific invited viewers) can open it, rather than leaving it public.
 1. Upload `List_of_Patients_Schedule.xlsx`.
 2. Upload one or more remittance PDFs.
 3. Optionally upload `List_of_Patients_Mutual.xlsx` to source the `DX` column.
-4. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
+4. Optionally upload `AMSMC_employees.xlsx` to fill the provider tabs.
+5. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
    (already paid) · W need review*.
-5. Work through the preview table. Untick anything you do not want applied.
+6. Work through the preview table. Untick anything you do not want applied.
    Items flagged **Needs review** start unticked. The **DX (from Mutual)**
    column shows what would go into a blank `DX` cell, and **Processed On** /
    **Remit Check/EFT #** show the audit stamps.
-6. Click **Confirm & generate file**, then **Download updated workbook**. The
-   file is named `List_of_Patients_Schedule_updated_YYYY-MM-DD.xlsx` so
-   successive archived copies do not collide.
+7. Review the per-provider **Employees file** section: what each tab would be
+   filled with or have appended, plus anything flagged *practitioner mismatch*
+   or *unassigned*.
+8. Click **Confirm & generate file**, then **Download updated schedule** — and,
+   if you uploaded it, **Download updated employees file**. They are named
+   `List_of_Patients_Schedule_updated_YYYY-MM-DD.xlsx` and
+   `AMSMC_employees_updated_YYYY-MM-DD.xlsx` so successive archived copies do
+   not collide.
+9. Use **Clear all data** when you are done to wipe the session.
 
 ---
 
@@ -243,19 +337,71 @@ matching **patient name** and the same **parsed calendar date** in `Data`, then:
 | Situation | Action |
 |---|---|
 | Match found, `Payment` empty | **Fill existing row N** — writes only the blank cells among `Billed`, `Payment`, `Co-pay`, `Comment`, `DX` |
-| Match found, `Payment` holds any value | **Skip (already paid)** |
+| Match found, `Payment` populated, **same** amounts | **Skip — already recorded** |
+| Match found, `Payment` populated, **different** amounts, remit is newer | **Updated (adjusted EOB)** — see below |
+| Match found, `Payment` populated, **different** amounts, remit is older | **Needs review** — nothing changes |
 | No match, patient already in the sheet | **New row** inserted under that patient's existing rows |
 | No match, patient not in the sheet | **New row** appended at the bottom |
 | Low-confidence name, unknown NPI, ambiguous multi-match, or ambiguous DX name | **Needs review** — never auto-applied |
 
 - **The dedup key is Patient + Data + CPT.** A payment is considered already
   recorded when the matched row has anything in `Payment`.
-- **`0.00` and `0` count as populated.** Only a truly empty cell is fillable.
-  A formula such as `=23.52+18.92` also counts as a value.
+- **`0.00` and `0` count as populated.** Only a truly empty cell is *fillable*.
+  A formula such as `=23.52+18.92` also counts as a value. A `0.00` row is
+  never filled — but if a later remit actually pays, it is *restated*, which is
+  the adjusted-EOB path below.
 - **Never overwrite.** Existing `DX`, `CPT Code`, `Co-pays Paid`, `Office`,
-  `Comment` or any other prefilled value is left exactly as-is. The one
-  deliberate exception is the app's own `Processed On` / `Remit Check/EFT #`
-  audit columns, which are refreshed on rows it touches this run.
+  `Comment` or any other prefilled value is left exactly as-is. There are two
+  deliberate exceptions: the app's own `Processed On` / `Remit Check/EFT #`
+  audit columns, which are refreshed on rows it touches this run; and a
+  confirmed **Updated (adjusted EOB)** row.
+
+### Adjusted EOBs (`replace_with_latest`)
+
+Medicare often issues a second remittance for a visit it has already reported —
+classically a first EOB paying `$0.00` and a later one that actually pays.
+Skipping those loses the real payment, so a differing amount is reconciled
+instead of ignored.
+
+The policy is `REPROCESS_POLICY = "replace_with_latest"` in
+[`remit/config.py`](remit/config.py): **a later Medicare remit restates the
+claim, so the recorded amount is replaced by the later one — amounts are never
+summed.** Two alternatives ship but are not the default: `sum` (add to the
+recorded amount) and `flag_only` (never propose a write).
+
+When an accepted update is applied, the matched row gets:
+
+| Column | New value |
+|---|---|
+| `Payment` | the later remit's amount |
+| `Co-pay` | the later remit's amount |
+| `Billed` | the later remit's header `DATE:` |
+| `Remit Check/EFT #` | the existing value **plus** the new number, joined with `; ` so the history stays visible |
+| `Processed On` | today |
+
+Rules that keep this safe:
+
+- **Order matters.** An update only happens when the incoming remit is *newer*
+  than the recorded `Billed`. An older remit arriving out of order never
+  downgrades a newer value — it is flagged *Needs review* and changes nothing.
+  When the recorded `Billed` is a placeholder like `2/32/26` the order cannot be
+  verified, so the update is proposed *with that stated in the preview*.
+- **Never a second row.** A restatement always targets the row it matched, on
+  patient + service date. If a later remit changed the CPT set it is still the
+  same visit: the change is flagged *Needs review* and, if accepted, updates
+  that row rather than appending a duplicate.
+- **Unreadable values are never clobbered.** If the recorded `Payment` is a
+  formula or free text it cannot be compared, so the row is flagged for review
+  instead of overwritten.
+- **Nothing is silent.** Every restatement shows **old → new** for `Payment`,
+  `Co-pay`, `Billed` and `Remit Check/EFT #` in the preview, plus a plain
+  explanation such as `was $0.00, now $130.46 (payment received)`. It is applied
+  only when you confirm.
+- **Several remits in one upload** are ordered by header `DATE:` and reconciled
+  to the newest; the preview notes how many contributed. Within a single
+  remittance the service lines of a visit are still summed as before.
+- Re-running an applied update is a no-op: the row now agrees with the remit,
+  so it classifies as *Skip — already recorded*.
 - **Names are compared, not rewritten.** Generational suffixes (`Jr`, `Sr`,
   `II`–`V`) are stripped for comparison only, so `Marchetti Jr, Dean` matches
   `MARCHETTI, DEAN` and gets filled instead of duplicated. The stored spelling of
@@ -285,10 +431,23 @@ private app, restrict viewer access to the people who need it, and treat the URL
 as sensitive. If your practice's agreements require a BAA, host it somewhere
 covered by one instead.
 
-Real patient files are excluded from git by `.gitignore`. Everything under
-`tests/fixtures/` is synthetic (see `tests/fixtures/README.md`) and is the only
-intentional exception. See `SECURITY.md` before working with real data in this
-repo, or before pushing any change to GitHub.
+Real patient files are excluded from git by `.gitignore` — including
+`AMSMC_employees*.xlsx`, which is PHI. Everything under `tests/fixtures/` is
+synthetic (see `tests/fixtures/README.md`) and is the only intentional
+exception.
+
+The app is hardened for this: uploads and downloads are held only in
+`BytesIO`, nothing is written to disk or `/tmp`, tracebacks are suppressed in
+the UI and exception text is scrubbed before display, telemetry is off, no PHI
+goes into caches or globals, downloads are named from the workbook and date
+only, and a **Clear all data** button wipes the session.
+
+**The app must not be left public.** Restrict it to an allowlist of Google
+accounts in Streamlit Community Cloud and do not share the URL beyond
+authorized staff. Note that Streamlit Community Cloud and GitHub are **not
+BAA-covered**, so processing real PHI there is itself a gap — see
+[`HIPAA.md`](HIPAA.md) for the full list of safeguards and that caveat, and
+`SECURITY.md` before pushing any change.
 
 ---
 

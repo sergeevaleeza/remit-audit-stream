@@ -20,6 +20,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from .config import (
     ACTION_FILL,
     ACTION_NEW,
+    ACTION_UPDATE,
     ALL_COLUMNS,
     AUDIT_COLUMNS,
     COL_BILLED,
@@ -151,6 +152,8 @@ def read_schedule_rows(worksheet: Worksheet, columns: dict[str, int]) -> list[Sc
                 comment=cell(COL_COMMENT),
                 dx=cell(COL_DX),
                 cpt=cell(COL_CPT),
+                processed_on=cell(COL_PROCESSED_ON),
+                check_eft=cell(COL_CHECK_EFT),
             )
         )
     return rows
@@ -297,7 +300,8 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
 
     applies = [
         change for change in changes
-        if change.accepted and change.effective_action in (ACTION_FILL, ACTION_NEW)
+        if change.accepted
+        and change.effective_action in (ACTION_FILL, ACTION_NEW, ACTION_UPDATE)
     ]
     # Only touch the header row when there is actually something to stamp.
     if applies:
@@ -328,6 +332,38 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
         if wrote_any:
             filled_rows += 1
             _stamp_audit(worksheet, columns, change.row_num, change)
+
+    # --- Adjusted EOBs -----------------------------------------------------
+    # The only place the app overwrites a populated cell. Reached solely by an
+    # accepted `Updated (adjusted EOB)` change, whose old -> new values the
+    # user saw in the preview before confirming.
+    updated_rows = 0
+    updated_cells = 0
+    for change in applies:
+        if change.effective_action != ACTION_UPDATE or change.row_num is None:
+            continue
+        if not change.updates:
+            continue
+        for header, value in change.updates.items():
+            if header in NEVER_TOUCH_COLUMNS:
+                continue
+            column = columns.get(header)
+            if column is None:
+                continue
+            worksheet.cell(row=change.row_num, column=column).value = value
+            updated_cells += 1
+        updated_rows += 1
+        _stamp_audit(worksheet, columns, change.row_num, change)
+
+    # Optional telehealth `Ins` correction, off by default. Only ever set when
+    # OVERWRITE_INS_FOR_TELEHEALTH is on and the EOB contradicts the row.
+    for change in applies:
+        if not change.ins_update or change.row_num is None:
+            continue
+        column = columns.get(COL_INS)
+        if column is not None:
+            worksheet.cell(row=change.row_num, column=column).value = change.ins_update
+            updated_cells += 1
 
     # --- New rows ----------------------------------------------------------
     # Placement is decided against the ORIGINAL layout (fills above have not
@@ -374,6 +410,8 @@ def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dic
     return {
         "filled_rows": filled_rows,
         "filled_cells": filled_cells,
+        "updated_rows": updated_rows,
+        "updated_cells": updated_cells,
         "inserted_rows": inserted_rows,
         "appended_rows": appended_rows,
         "new_rows": inserted_rows + appended_rows,

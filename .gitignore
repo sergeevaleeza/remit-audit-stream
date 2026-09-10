@@ -29,3 +29,8 @@ npi_map.local.json
 
 # Local-only PHI denylist for scripts/check_for_phi.py (real surnames etc).
 phi_denylist.local.txt
+
+# The employees workbook is PHI (patient names + payments). The synthetic
+# test fixture is AMSMC_employees_sample.xlsx and is tracked deliberately.
+AMSMC_employees*.xlsx
+!tests/fixtures/AMSMC_employees_sample.xlsx

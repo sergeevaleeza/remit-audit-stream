@@ -177,11 +177,16 @@ def test_blank_billed_would_be_filled(visits, schedule):
 
 # --- Zero is not blank -----------------------------------------------------
 
-def test_zero_payment_counts_as_recorded(plan):
-    """Whitfield 03/04/2026 has Payment 0.00 in the sheet."""
+def test_zero_payment_is_never_treated_as_fillable(plan):
+    """Whitfield 03/04/2026 has Payment 0.00, which is a recorded value.
+
+    `0.00` still never counts as a blank cell, so this is never a *fill*.
+    Because the remit reports a different amount it is now reconciled as an
+    adjusted EOB rather than skipped -- see `test_adjusted_eob.py`.
+    """
     change = change_for(plan, "WHITFIELD, HAROLD", date(2026, 3, 4))
-    assert change.action == ACTION_SKIP
     assert change.action != ACTION_FILL
+    assert COL_PAYMENT not in change.fills
 
 
 def test_is_blank_treats_zero_and_formulas_as_values():
@@ -193,10 +198,19 @@ def test_is_blank_treats_zero_and_formulas_as_values():
     assert not is_blank("=23.52+18.92")
 
 
-def test_zero_payment_survives_the_write(schedule_bytes, plan):
-    updated, _ = build_updated_workbook(schedule_bytes, plan)
-    worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
-    assert worksheet.cell(row=8, column=5).value == 0.00
+def test_zero_payment_survives_when_the_remit_agrees(schedule_bytes, visits, schedule):
+    """A `0.00` row is only rewritten when a later remit actually differs."""
+    visit = find_visit(visits, "WHITFIELD, HAROLD", date(2026, 3, 4))
+    original_payment, original_copay = visit.payment, visit.copay
+    visit.payment, visit.copay = 0.0, 0.0
+    try:
+        plan = build_plan([visit], schedule[3])
+        assert plan[0].action == ACTION_SKIP
+        updated, _ = build_updated_workbook(schedule_bytes, plan)
+        worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
+        assert worksheet.cell(row=8, column=5).value == 0.00
+    finally:
+        visit.payment, visit.copay = original_payment, original_copay
 
 
 # --- New-row path ----------------------------------------------------------
@@ -244,12 +258,14 @@ def test_new_rows_do_not_disturb_existing_rows(schedule_bytes, plan, schedule):
 
     assert worksheet.cell(row=3, column=1).value == "Marlowe, Diane"
 
+    updated_rows = {c.row_num for c in plan if c.accepted and c.updates}
     for original in schedule[3]:
         found = find_row(worksheet, str(original.patient), original.data)
         assert found["Patient"] == original.patient
         assert found["CPT Code"] == original.cpt
-        # An untouched row keeps its exact Payment; a filled one gains a value.
-        if original.payment is not None:
+        # An untouched row keeps its exact Payment; a filled one gains a value
+        # and an adjusted-EOB row is deliberately restated.
+        if original.payment is not None and original.row_num not in updated_rows:
             assert found["Payment"] == original.payment
 
 
@@ -369,7 +385,8 @@ def test_output_is_a_standalone_workbook(schedule_bytes, plan):
 def test_summary_counts_add_up(plan):
     counts = summarize(plan)
     assert counts["visits"] == len(plan)
-    assert counts["fill"] + counts["new"] + counts["skip"] + counts["review"] == counts["visits"]
+    assert (counts["fill"] + counts["new"] + counts["skip"]
+            + counts["update"] + counts["review"]) == counts["visits"]
 
 
 def test_download_filename_is_date_stamped():

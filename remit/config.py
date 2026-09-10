@@ -66,8 +66,17 @@ NEVER_TOUCH_COLUMNS = (COL_COPAYS_PAID, COL_OFFICE)
 #: this format rather than coerced to Excel date serials.
 DATE_FMT = "%m/%d/%Y"
 
-#: Literal written into the Ins column for every new row.
+#: Default `Ins` value: an ordinary in-office Medicare encounter.
 INSURANCE_VALUE = "Medicare"
+
+#: `Ins` value for a telehealth encounter -- POS 10 (patient's home) billed
+#: with the 95 modifier. Derived per visit by `pdf_parser.insurance_label`.
+TELEHEALTH_INSURANCE_LABEL = "POS 10(95)"
+
+#: Existing schedule rows already say `Medicare`. Per never-overwrite they are
+#: left alone and merely flagged when the EOB says telehealth. Set True to
+#: rewrite those specific `Ins` cells to the telehealth label instead.
+OVERWRITE_INS_FOR_TELEHEALTH = False
 
 # --- Provider mapping -------------------------------------------------------
 #
@@ -148,8 +157,80 @@ ACTION_SKIP = "Skip (already paid)"
 ACTION_NEW = "New row"
 ACTION_REVIEW = "Needs review"
 
+#: A later remit restated a visit that is already recorded with different
+#: amounts. Distinct from a fill (the cell was blank) and from a skip (the
+#: values agree), because applying it overwrites a recorded value.
+ACTION_UPDATE = "Updated (adjusted EOB)"
+
+# --- Reprocessing policy ----------------------------------------------------
+
+#: What to do when a later remittance reports different amounts for a visit
+#: that is already recorded in the schedule.
+#:
+#: ``replace_with_latest`` -- a later Medicare remit *restates* the claim, so
+#: the recorded amount is replaced by the later remit's amount. This is the
+#: default and the only policy that writes.
+#: ``sum`` -- add the later remit's amount to what is recorded. Only correct
+#: if the payer issues supplemental payments rather than restatements.
+#: ``flag_only`` -- never propose a write; surface every difference for review.
+REPROCESS_REPLACE = "replace_with_latest"
+REPROCESS_SUM = "sum"
+REPROCESS_FLAG_ONLY = "flag_only"
+
+REPROCESS_POLICY = REPROCESS_REPLACE
+
+#: Money is compared at cent precision; anything closer is the same value.
+AMOUNT_TOLERANCE = 0.005
+
 #: Two-digit years are expanded into this century.
 CENTURY_PREFIX = 2000
+
+# --- Employees workbook (AMSMC_employees.xlsx) ------------------------------
+#
+# An optional fourth upload. One sheet per practitioner; the header row is not
+# in the same place on every sheet, so it is located by scanning the first two
+# rows for the expected labels rather than assumed.
+
+EMPLOYEE_SHEETS = ("Ana", "Marcia", "Oxana")
+
+#: How far down to look for the header row (1-based, inclusive).
+EMPLOYEE_HEADER_SEARCH_ROWS = 2
+
+#: Where each provider's insurance payment goes. Ana's tab keeps the payer's
+#: payment in a separate column from the practice's own `Paid by Insurance`.
+EMPLOYEE_PAYMENT_COLUMN = {
+    "Ana": "Paid by Ins toAna",
+    "Oxana": "Paid by Insurance",
+    "Marcia": "Paid by Insurance",
+}
+
+#: The patient-name header differs on Oxana's sheet.
+EMPLOYEE_PATIENT_HEADERS = ("Patient Name", "Patient")
+
+EMPLOYEE_COL_INSURANCE = "Insurance"
+EMPLOYEE_COL_COPAY_EOB = "Co-pay by EOB"
+EMPLOYEE_COL_DATE = "Date of Session"
+
+#: Tabs the app may append brand-new visits to. Marcia's tab is fill-only.
+EMPLOYEE_APPEND_SHEETS = ("Ana", "Oxana")
+
+#: `all_matching` syncs every matching schedule visit into the tabs, deduped
+#: by patient + Date of Session so nothing is added twice.
+EMPLOYEES_SCOPE = "all_matching"
+
+#: A patient in no provider tab cannot be assigned by name. With False they
+#: are listed as unassigned; with True a brand-new patient is appended to the
+#: tab named by their schedule `Comment`.
+FALLBACK_TO_COMMENT_FOR_NEW = False
+
+# --- Employees actions ------------------------------------------------------
+
+EMP_ACTION_FILL = "Fill existing row"
+EMP_ACTION_APPEND = "Append new row"
+EMP_ACTION_NO_MATCH = "No Schedule match"
+EMP_ACTION_MISMATCH = "Practitioner mismatch - needs review"
+EMP_ACTION_UNASSIGNED = "Unassigned - needs manual placement"
+EMP_ACTION_NOTHING = "Nothing to fill"
 
 # --- Name normalisation -----------------------------------------------------
 

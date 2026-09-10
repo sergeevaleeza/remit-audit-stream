@@ -14,7 +14,13 @@ from typing import Iterable, Sequence
 
 import pdfplumber
 
-from .config import CENTURY_PREFIX, DATE_FMT, NPI_TO_DOCTOR
+from .config import (
+    CENTURY_PREFIX,
+    DATE_FMT,
+    INSURANCE_VALUE,
+    NPI_TO_DOCTOR,
+    TELEHEALTH_INSURANCE_LABEL,
+)
 
 # --- Line shapes -----------------------------------------------------------
 
@@ -40,6 +46,15 @@ _SERV_DATE_RE = re.compile(r"^\d{6}$")
 # Procedure codes seen on these remits: 5 alphanumerics, digit-led.
 _PROC_RE = re.compile(r"^\d[0-9A-Z]{4}$")
 
+# Place of service: the 2-digit token straight after the 6-digit service date.
+_POS_RE = re.compile(r"^\d{2}$")
+
+#: POS code for the patient's home, which with modifier 95 means telehealth.
+POS_TELEHEALTH = "10"
+
+#: The telehealth modifier printed after PROC.
+MODIFIER_TELEHEALTH = "95"
+
 # Evaluation & management codes sort before psychotherapy add-ons.
 _EM_PREFIX = "99"
 
@@ -62,6 +77,14 @@ class ServiceLine:
     prov_pd: float
     source_file: str
     check_eft: str | None = None
+    #: Place of service (`11` office, `10` the patient's home) and any CPT
+    #: modifiers, used to tell a telehealth encounter from an in-office one.
+    pos: str | None = None
+    modifiers: tuple[str, ...] = ()
+
+    @property
+    def telehealth(self) -> bool:
+        return self.pos == POS_TELEHEALTH and MODIFIER_TELEHEALTH in self.modifiers
 
 
 @dataclass
@@ -77,6 +100,32 @@ class Visit:
     copay: float = 0.0
     source_files: set[str] = field(default_factory=set)
     check_efts: set[str] = field(default_factory=set)
+
+    #: How many remittances in this run reported this visit. More than one
+    #: means later remits restated it; only the newest supplies the amounts.
+    remit_count: int = 1
+    #: Payments from the superseded (older) remits, oldest first.
+    superseded_payments: list[float] = field(default_factory=list)
+
+    #: Place of service and modifiers, carried up from the service lines.
+    #: These are consistent across a visit's CPT lines on these remits.
+    pos: str | None = None
+    modifiers: set[str] = field(default_factory=set)
+
+    @property
+    def telehealth(self) -> bool:
+        """POS 10 (patient's home) plus the 95 modifier."""
+        return self.pos == POS_TELEHEALTH and MODIFIER_TELEHEALTH in self.modifiers
+
+    @property
+    def insurance(self) -> str:
+        """The `Ins` value this visit implies."""
+        return insurance_label(self)
+
+    @property
+    def restated(self) -> bool:
+        """True when more than one uploaded remit reported this visit."""
+        return self.remit_count > 1
 
     @property
     def doctor(self) -> str:
@@ -118,6 +167,19 @@ class RemitDocument:
     @property
     def total_prov_pd(self) -> float:
         return round(sum(line.prov_pd for line in self.service_lines), 2)
+
+
+def insurance_label(visit: "Visit") -> str:
+    """The `Ins` value for a visit: telehealth is called out, else Medicare.
+
+    Replaces the old "Ins is always Medicare" constant. A visit billed from
+    the patient's home (POS 10) with the 95 modifier is a telehealth
+    encounter and is labelled `POS 10(95)` so it is visible in the schedule
+    and in the employees workbook.
+    """
+    if visit.telehealth:
+        return TELEHEALTH_INSURANCE_LABEL
+    return INSURANCE_VALUE
 
 
 def order_cpt_codes(codes: Iterable[str]) -> list[str]:
@@ -178,26 +240,46 @@ def parse_service_line(line: str, patient: str, source_file: str,
 
     npi = tokens[0]
 
-    service_date = next(
-        (d for d in (parse_serv_date(t) for t in tokens[1:]) if d is not None), None
-    )
+    service_date = None
+    date_index = None
+    for index, token in enumerate(tokens[1:], start=1):
+        parsed = parse_serv_date(token)
+        if parsed is not None:
+            service_date, date_index = parsed, index
+            break
     if service_date is None:
         return None
 
-    # PROC sits after the two date tokens, POS and NOS, and always before the
-    # money columns. Stopping at the first dollar amount keeps a modifier or a
-    # trailing code from being mistaken for the procedure.
+    # POS is the 2-digit token immediately after the 6-digit service date:
+    # `... MMDD MMDDYY POS NOS PROC ...`. 11 = office, 10 = patient's home
+    # (telehealth).
+    pos = None
+    if date_index + 1 < len(tokens) and _POS_RE.match(tokens[date_index + 1]):
+        pos = tokens[date_index + 1]
+
+    # PROC sits after POS and NOS, and always before the money columns.
+    # Stopping at the first dollar amount keeps a modifier or a trailing code
+    # from being mistaken for the procedure.
     proc = None
-    for token in tokens[1:]:
+    proc_index = None
+    for index, token in enumerate(tokens[1:], start=1):
         if _AMOUNT_RE.match(token):
             break
         if _SERV_DATE_RE.match(token):
             continue
         if _PROC_RE.match(token):
-            proc = token
+            proc, proc_index = token, index
             break
     if proc is None:
         return None
+
+    # Anything between PROC and the money columns is a modifier; `95` marks a
+    # telehealth encounter.
+    modifiers = []
+    for token in tokens[proc_index + 1:]:
+        if _AMOUNT_RE.match(token):
+            break
+        modifiers.append(token)
 
     amounts = [float(t) for t in tokens if _AMOUNT_RE.match(t)]
     if len(amounts) < _EXPECTED_AMOUNTS:
@@ -212,6 +294,8 @@ def parse_service_line(line: str, patient: str, source_file: str,
         prov_pd=amounts[-1],
         source_file=source_file,
         check_eft=check_eft,
+        pos=pos,
+        modifiers=tuple(modifiers),
     )
 
 
@@ -259,37 +343,79 @@ def parse_document(file_obj, filename: str = "remit.pdf") -> RemitDocument:
 
 
 def aggregate_visits(documents: Sequence[RemitDocument]) -> list[Visit]:
-    """Group every service line by (patient, service date, provider NPI).
+    """Group service lines into one visit per (patient, service date, NPI).
 
-    Aggregation spans claim blocks and uploaded files, so a patient appearing
-    under several ICNs still yields one visit per date and provider.
+    Within a single remittance the lines of a visit are summed, so a patient
+    appearing under several ICNs still yields one visit per date and provider.
+
+    Across remittances the amounts are **not** summed: a later Medicare remit
+    restates the claim rather than topping it up, so the newest remit (by its
+    header ``DATE:``) supplies the visit's amounts. Superseded values are kept
+    on the visit so the preview can show what changed.
     """
-    billed_by_file = {doc.filename: doc.billed_date for doc in documents}
     fallback_billed = next(
         (doc.billed_date for doc in documents if doc.billed_date is not None), None
     )
 
-    visits: dict[tuple[str, date, str], Visit] = {}
+    # Aggregate within each document first, keyed by document index so two
+    # uploads sharing a filename cannot collide.
+    per_document: list[tuple[RemitDocument, dict[tuple[str, date, str], Visit]]] = []
     for doc in documents:
+        bucket: dict[tuple[str, date, str], Visit] = {}
         for line in doc.service_lines:
             key = (line.patient, line.service_date, line.npi)
-            visit = visits.get(key)
+            visit = bucket.get(key)
             if visit is None:
                 visit = Visit(
                     patient=line.patient,
                     service_date=line.service_date,
                     npi=line.npi,
-                    billed_date=billed_by_file.get(line.source_file) or fallback_billed,
+                    billed_date=doc.billed_date or fallback_billed,
                 )
-                visits[key] = visit
+                bucket[key] = visit
             visit.cpt_codes.append(line.proc)
             visit.payment = round(visit.payment + line.prov_pd, 2)
             visit.copay = round(visit.copay + line.coins, 2)
             visit.source_files.add(line.source_file)
             if line.check_eft:
                 visit.check_efts.add(line.check_eft)
+            if line.pos and visit.pos is None:
+                visit.pos = line.pos
+            visit.modifiers.update(line.modifiers)
+        per_document.append((doc, bucket))
 
-    return sorted(visits.values(), key=lambda v: (v.patient, v.service_date, v.npi))
+    # Reconcile across documents: newest remit wins.
+    merged: dict[tuple[str, date, str], Visit] = {}
+    for _, bucket in per_document:
+        for key, candidate in bucket.items():
+            current = merged.get(key)
+            if current is None:
+                merged[key] = candidate
+                continue
+
+            older, newer = _order_by_remit_date(current, candidate)
+            newer.remit_count = current.remit_count + candidate.remit_count
+            newer.superseded_payments = (
+                older.superseded_payments + newer.superseded_payments + [older.payment]
+            )
+            # Every contributing check number is kept so the audit trail on the
+            # row shows the full history, not just the winning remit.
+            newer.check_efts = current.check_efts | candidate.check_efts
+            newer.source_files = current.source_files | candidate.source_files
+            merged[key] = newer
+
+    return sorted(merged.values(), key=lambda v: (v.patient, v.service_date, v.npi))
+
+
+def _order_by_remit_date(first: Visit, second: Visit) -> tuple[Visit, Visit]:
+    """(older, newer) by remit header date; a dated remit beats an undated one."""
+    if first.billed_date is None:
+        return first, second
+    if second.billed_date is None:
+        return second, first
+    if second.billed_date >= first.billed_date:
+        return first, second
+    return second, first
 
 
 def parse_remittances(files: Sequence[tuple[object, str]]) -> tuple[list[RemitDocument], list[Visit]]:

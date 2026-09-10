@@ -1,6 +1,16 @@
 [server]
-# Remittance PDFs and the schedule workbook are both comfortably under this.
+# Remittance PDFs and the workbooks are all comfortably under this.
 maxUploadSize = 50
 
 [browser]
+# No usage telemetry leaves this app.
 gatherUsageStats = false
+
+[client]
+# Raw tracebacks can contain cell values and patient names. Suppress them in
+# the UI; the app catches exceptions and shows a generic message instead.
+showErrorDetails = false
+
+[logger]
+# Keep the server log free of request-level detail.
+level = "error"
