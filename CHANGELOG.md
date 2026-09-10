@@ -3,6 +3,93 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.1] — 2026-09-10
+
+Hardens service-line amount extraction against non-zero deductibles and
+amount-carrying continuation lines, and locks both with regression cover.
+312 tests pass (was 281).
+
+### Investigated — the reported all-zero symptom did not reproduce
+
+The report was that a patient's nine `90834` visits under one provider were all
+written with `Payment = 0` and `Co-pay = 0`, with a non-zero `DEDUCT` and/or
+bare `CO-253` continuation lines as the suspected trigger.
+
+Running the current parser over the real remittance that contains those visits
+returns the correct figures:
+
+| Service date | Payment | Co-pay | Why |
+|---|---|---|---|
+| 01/15, 02/10 | `0.00` | `0.00` | genuine — `ALLOWED` fully consumed by `DEDUCT` |
+| 03/11 | `90.94` | `23.20` | partial deductible |
+| 03/31 … 06/16 (×6) | `104.27` | `26.60` | no deductible remaining |
+
+Claim totals `716.56` / `182.80`, whole-file `PROV-PD` `1332.11` — matching that
+remit's own `TOTALS … PROV PD AMT` line exactly, with a `DEDUCT` total of
+`283.00` confirming the deductible path really was exercised.
+
+Two further checks:
+
+- A scan of every remittance on hand found **1156 service lines, all with
+  exactly six dollar amounts** — no continuation line is ever being folded into
+  a service line by text extraction — alongside 521 bare `CO-### <amt>`
+  continuations, all correctly skipped.
+- Every version of `pdf_parser.py` in this repository's history has used the
+  10-digit-NPI skip rule and `_COINS_INDEX = 3`. The `REM:` prefix appears only
+  in a docstring, never in logic, so the described defect has never been present
+  here. The most likely explanation for what was observed is a **stale
+  deployment** (Streamlit keeps imported modules in `sys.modules`, so pushing
+  changes under `remit/` requires rebooting the Cloud app).
+
+### Fixed — `PROV-PD` was read as "the last amount", not the sixth
+
+While confirming the above, one genuine latent defect surfaced, and it produces
+exactly the reported symptom if it is ever reached: `prov_pd` was taken as
+`amounts[-1]` rather than by position. The canonical layout has six amounts —
+`BILLED, ALLOWED, DEDUCT, COINS, RC-AMT, PROV-PD` — so if a seventh ever trailed
+the line (the shape that would occur if a bare `CO-253 2.13` continuation were
+merged into it by a future pdfplumber/layout change), `PROV-PD` would silently
+become the sequestration figure:
+
+```
+… 200.00 133.00 0.00 26.60 CO-45 67.00 104.27 CO-253 2.13
+before -> prov_pd = 2.13      after -> prov_pd = 104.27
+```
+
+`PROV-PD` is now read at index 5 and `COINS` at index 3, both positional. No
+current input changes behaviour — all 1156 real service lines have exactly six
+amounts — but the failure mode is now unreachable.
+
+### Added
+
+- `ServiceLine.deduct`, so the deductible is carried as its own field and can
+  never be conflated with `COINS` or `PROV-PD`. Named index constants
+  (`_BILLED_INDEX` … `_PROV_PD_INDEX`) replace the bare literals.
+- `tests/fixtures/RemitDoc-0000000002.PDF`, a **synthetic** second remittance
+  built by `make_deductible_fixture.py` reproducing the reported shapes: two
+  lines where `ALLOWED` is fully consumed by `DEDUCT` (`PROV-PD` a genuine
+  `0.00`), one partial deductible, six fully-paid lines, **bare `CO-253 <amt>`
+  continuations with no `REM:` prefix**, and one patient billed under two
+  performing-provider NPIs. Its `TOTALS` line reads `1332.11`, and the per-visit
+  figures match the real file's exactly. The real PDF is PHI and is not
+  committed.
+- `tests/test_deductible_regression.py` (31 tests): the nine per-visit values,
+  the `716.56` / `182.80` claim totals, the `1332.11` whole-file total, the
+  physician visits for the same patient, `DEDUCT` never conflated with `COINS`
+  or `PROV-PD`, bare and `REM:`-prefixed continuations both skipped, the skip
+  rule being keyed on "does not start with a 10-digit NPI" rather than on the
+  `REM:` prefix, continuation amounts never reaching a visit, and a guard that
+  the first fixture's zero-deductible path still totals unchanged.
+
+### Note on already-written zeros
+
+If an earlier run did write `0` into schedule rows for visits that were in fact
+paid, the current app corrects them rather than skipping: a recorded amount that
+disagrees with the remit is classified **`Updated (adjusted EOB)`** (added in
+1.4.0) and shown as `was $0.00, now $104.27 (payment received)` for confirmation.
+
+---
+
 ## [1.5.0] — 2026-09-10
 
 Adds the `AMSMC_employees.xlsx` workbook as a fourth upload and a second
@@ -545,6 +632,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.5.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.1
 [1.5.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.0
 [1.4.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.4.0
 [1.3.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.3.0

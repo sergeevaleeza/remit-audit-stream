@@ -61,8 +61,16 @@ _EM_PREFIX = "99"
 # Expected number of dollar amounts on a well-formed service line.
 _EXPECTED_AMOUNTS = 6
 
-# Index of COINS within the ordered dollar amounts.
+# Positions within the ordered dollar amounts of a service line:
+#   [BILLED, ALLOWED, DEDUCT, COINS, RC-AMT, PROV-PD]
+# DEDUCT is its own field and is never conflated with COINS or PROV-PD; a
+# non-zero deductible simply means ALLOWED was partly consumed before COINS.
+_BILLED_INDEX = 0
+_ALLOWED_INDEX = 1
+_DEDUCT_INDEX = 2
 _COINS_INDEX = 3
+_RC_AMT_INDEX = 4
+_PROV_PD_INDEX = 5
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,10 @@ class ServiceLine:
     prov_pd: float
     source_file: str
     check_eft: str | None = None
+    #: The deductible applied to this line. Kept distinct from COINS and
+    #: PROV-PD: a non-zero deductible consumes part of ALLOWED and legitimately
+    #: drives PROV-PD to 0.00 without meaning the line failed to parse.
+    deduct: float = 0.0
     #: Place of service (`11` office, `10` the patient's home) and any CPT
     #: modifiers, used to tell a telehealth encounter from an in-office one.
     pos: str | None = None
@@ -281,6 +293,12 @@ def parse_service_line(line: str, patient: str, source_file: str,
             break
         modifiers.append(token)
 
+    # Amounts come from THIS physical line only -- a continuation line is
+    # never merged in, because it does not start with a 10-digit NPI and so
+    # never reaches this function. The canonical layout has exactly six
+    # amounts, so they are read positionally rather than relative to the end:
+    # were a stray amount ever to trail the line, `amounts[-1]` would silently
+    # return that instead of PROV-PD.
     amounts = [float(t) for t in tokens if _AMOUNT_RE.match(t)]
     if len(amounts) < _EXPECTED_AMOUNTS:
         return None
@@ -290,8 +308,9 @@ def parse_service_line(line: str, patient: str, source_file: str,
         npi=npi,
         service_date=service_date,
         proc=proc,
+        deduct=amounts[_DEDUCT_INDEX],
         coins=amounts[_COINS_INDEX],
-        prov_pd=amounts[-1],
+        prov_pd=amounts[_PROV_PD_INDEX],
         source_file=source_file,
         check_eft=check_eft,
         pos=pos,

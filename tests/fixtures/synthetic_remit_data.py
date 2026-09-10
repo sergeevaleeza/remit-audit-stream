@@ -278,3 +278,56 @@ MUTUAL_ROWS: list[tuple[str, str, str]] = [
     ("Delacroix, Owen", "F90.0", "Dr. B"),
     # OKAFOR and PETROSSIAN are deliberately absent -> DX left blank.
 ]
+
+
+# --- Second fixture: deductibles and bare continuation lines ----------------
+#
+# Reproduces the structural shapes that make a service line easy to misparse:
+#   (a) two lines where ALLOWED is fully consumed by DEDUCT, so PROV-PD is a
+#       genuine 0.00 -- not a parse failure;
+#   (b) a line with a partial deductible;
+#   (c) several fully-paid lines;
+#   (d) bare `CO-253 <amt>` continuation lines with NO `REM:` prefix, which is
+#       why continuations are skipped on "does not start with a 10-digit NPI"
+#       rather than on the `REM:` prefix;
+#   (e) the same patient billed under two different performing-provider NPIs.
+#
+# All names/MBIs/ICNs are fictional. The dollar figures are public Medicare
+# fee-schedule amounts for these codes, reused for a fictional person.
+
+DEDUCT_HEADER_DATE = "07/20/26"  # -> 07/20/2026
+DEDUCT_CHECK_EFT = "900000002"
+
+#: The therapist's own NPI, distinct from the physician's.
+SYNTHETIC_THERAPIST_NPI = "1000000003"
+
+#: 90834 (45-minute psychotherapy): billed/allowed/RC are constant; the
+#: deductible split varies line to line.
+CPT_90834_BILLED = 200.00
+CPT_90834_ALLOWED = 133.00
+CPT_90834_RC = 67.00
+
+#: (service date, DEDUCT, COINS, PROV-PD, sequestration on the continuation)
+#: ALLOWED - DEDUCT - COINS - sequestration = PROV-PD on every row.
+DEDUCTIBLE_LINES: list[tuple[str, float, float, float, float | None]] = [
+    ("2026-01-15", 133.00, 0.00, 0.00, None),    # allowed fully deducted
+    ("2026-02-10", 133.00, 0.00, 0.00, None),    # allowed fully deducted
+    ("2026-03-11", 17.00, 23.20, 90.94, 1.86),   # partial deductible
+    ("2026-03-31", 0.00, 26.60, 104.27, 2.13),   # fully paid
+    ("2026-04-15", 0.00, 26.60, 104.27, 2.13),
+    ("2026-05-04", 0.00, 26.60, 104.27, 2.13),
+    ("2026-05-20", 0.00, 26.60, 104.27, 2.13),
+    ("2026-06-02", 0.00, 26.60, 104.27, 2.13),
+    ("2026-06-16", 0.00, 26.60, 104.27, 2.13),
+]
+
+#: The same fictional patient, billed under the physician's NPI on other dates.
+PHYSICIAN_CLAIM_LINES: list[tuple[str, tuple[str, ...]]] = [
+    ("2026-04-28", ("99214", "90836")),
+    ("2026-05-05", ("99214", "90836")),
+    ("2026-06-07", ("99213", "90833")),
+]
+
+DEDUCT_PATIENT_NAME = "QUIMBY, THEODORA"
+DEDUCT_PATIENT_MBI = _mbi("0201")
+DEDUCT_PATIENT_ACCT = "QUIMBT"
