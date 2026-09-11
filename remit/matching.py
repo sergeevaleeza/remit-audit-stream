@@ -360,6 +360,9 @@ class Change:
     #: Plain-language notes about the restatement, shown in the preview.
     update_notes: list[str] = field(default_factory=list)
 
+    #: Explains a discarded OA-18 duplicate, or a duplicate-only visit.
+    duplicate_note: str = ""
+
     #: Set when the EOB says telehealth but the matched row's `Ins` does not.
     #: Surfaced in the preview; the cell itself is only rewritten when
     #: OVERWRITE_INS_FOR_TELEHEALTH is on, via `ins_update`.
@@ -757,15 +760,24 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
     review_reasons: list[str] = []
     if not visit.known_provider:
         review_reasons.append(f"Unknown provider NPI {visit.npi} - Comment left blank")
-    if len(visit.check_efts) > 1:
+    # An extra EFT that belongs to a discarded OA-18 duplicate is already
+    # explained by `duplicate_note`, so it is not a reason to stop and ask.
+    unexplained_efts = visit.check_efts - visit.ignored_duplicate_efts
+    if len(unexplained_efts) > 1:
         review_reasons.append(
             "Service lines came from more than one check/EFT "
-            f"({', '.join(sorted(visit.check_efts))}) - verify before applying"
+            f"({', '.join(sorted(unexplained_efts))}) - verify before applying"
         )
 
     dx_value, dx_status, dx_note, dx_reason = _dx_for(visit, dx_lookup)
     if dx_reason:
         review_reasons.append(dx_reason)
+
+    # An OA-18 exact duplicate is adjudicated at $0 because the original
+    # already paid. If every occurrence was a duplicate, the paying remit was
+    # never uploaded, so there is no real amount to record.
+    if visit.duplicate_only:
+        review_reasons.append(visit.duplicate_note)
 
 
 
@@ -777,6 +789,7 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
         dx_note=dx_note,
         processed_on=(today or date.today()).strftime(DATE_FMT),
         check_eft_display=CHECK_EFT_JOINER.join(sorted(visit.check_efts)),
+        duplicate_note=visit.duplicate_note,
         anchor_row=anchor_row,
         anchor_patient=anchor_patient,
     )

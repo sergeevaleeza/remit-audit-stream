@@ -3,6 +3,85 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.2] — 2026-09-10
+
+An `OA-18` exact-duplicate remittance could overwrite a real payment with
+`$0.00`. Reason-18 occurrences are now non-authoritative. 344 tests pass
+(was 312). **This is the mechanism behind the all-zero visits.**
+
+### Fixed — a duplicate EOB no longer zeroes a real payment
+
+Medicare reason code **18** — group `OA` or `CO` — means *"exact duplicate
+claim/service"*. A duplicate is adjudicated at `$0` because the original
+already paid. Under plain `replace_with_latest`, a duplicate remittance
+arriving later therefore replaced the genuine payment with zero.
+
+Reproduced on the real files before changing anything: the paying remit
+(`DATE: 07/30`) and the duplicate (`DATE: 08/27`, nine `OA-18` lines for the
+same dates) processed together collapsed nine visits from `716.56` to `104.27`,
+eight of them zeroed. After the fix those nine visits reconcile to
+`0, 0, 90.94, 104.27 × 6` — **`716.56`** / COINS **`182.80`** — in either
+upload order.
+
+**Rule:** an occurrence carrying reason 18 is *not authoritative*. It can never
+contribute, overwrite, zero or downgrade a value.
+
+- Amounts come from the **newest non-duplicate occurrence** by remit `DATE:`.
+  This is order-independent — a later duplicate never beats an earlier real
+  payment.
+- The audit trail still lists **every** EFT that mentioned the visit; only the
+  duplicate's *amounts* are discarded, not the fact of it.
+- The preview explains it — *"OA-18 duplicate from EFT x ignored; kept payment
+  from EFT y"* — and does **not** mark the row *Needs review*, because a clean
+  authoritative payment exists. It is simply applied.
+- If a visit is seen **only** as a duplicate (the paying remit was never
+  uploaded), it is flagged *Duplicate only (OA-18) — original paying remit not
+  uploaded; verify* rather than written as a real `$0.00`.
+- For non-duplicate occurrences, `replace_with_latest` is unchanged.
+
+**Discrimination is by reason code, never by amount.** A `$0.00` line carrying
+`CO-45` because the deductible consumed the whole allowed amount has no code 18
+and behaves exactly as before — still a genuine `$0.00`, still not a duplicate.
+
+### Added — the parser captures adjustment reason codes
+
+- `ServiceLine.codes` collects every `XX-nnn` group/reason token from the
+  service line **and** from its continuation lines (the indented `REM:` /
+  `CO-###` rows beneath it). Codes are folded upward onto the service line;
+  continuation lines are still never treated as service lines, so `COINS` and
+  `PROV-PD` are unaffected — they remain the 4th and 6th of the six dollar
+  amounts on the service line itself.
+- `ServiceLine.is_duplicate` / `Visit.is_duplicate`, matching on the numeric
+  reason `18` regardless of group prefix, so `OA-18` and `CO-18` both count
+  while `CO-118` and `OA-181` do not.
+- `Visit.duplicate_only`, `Visit.ignored_duplicate_efts`,
+  `Visit.authoritative_eft` and `Visit.duplicate_note`, plus
+  `Change.duplicate_note` surfaced in the preview's *Why* column.
+- `aggregate_visits` now gathers all occurrences of a visit and reconciles them
+  in one pass (`_reconcile`) rather than merging pairwise, which is what makes
+  the outcome independent of upload order.
+
+### Changed
+
+- The multi-EFT *Needs review* flag no longer fires when the extra EFT belongs
+  to a discarded duplicate — that case is now explained by `duplicate_note`
+  instead of stopping the user.
+
+### Added — fixtures and tests
+
+- `tests/fixtures/RemitDoc-0000000003.PDF`, a **synthetic** later remittance
+  built by `make_duplicate_fixture.py`: nine `OA-18` duplicates of the paying
+  fixture's visits, one genuinely new paid visit, and one visit present only as
+  a duplicate. Real remittances stay gitignored.
+- `tests/test_duplicate_reason_18.py` (32 tests): the real payment surviving a
+  later duplicate, upload-order independence, both EFTs on the audit trail, the
+  duplicate-only flag and its *Needs review*, a `CO-45` deductible `$0.00`
+  staying a genuine zero, `CO-18` treated the same as `OA-18`, near-miss codes
+  (`CO-118`, `OA-181`) rejected, continuation-line code folding, and
+  `replace_with_latest` still applying between two non-duplicate occurrences.
+
+---
+
 ## [1.5.1] — 2026-09-10
 
 Hardens service-line amount extraction against non-zero deductibles and
@@ -632,6 +711,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.5.2]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.2
 [1.5.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.1
 [1.5.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.0
 [1.4.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.4.0

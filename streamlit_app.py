@@ -111,7 +111,7 @@ def plan_to_frame(changes) -> pd.DataFrame:
                 "Co-pay old → new": change.change_display(COL_COPAY) or "—",
                 "Billed old → new": change.change_display(COL_BILLED) or "—",
                 "Check/EFT old → new": change.change_display(COL_CHECK_EFT) or "—",
-                "Why": change.update_summary or "—",
+                "Why": change.update_summary or change.duplicate_note or "—",
                 "Placement": change.placement_display or "—",
                 "Matched row": change.row_num or "—",
                 "Match %": "—" if change.score is None else f"{change.score:.0f}",

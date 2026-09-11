@@ -331,3 +331,27 @@ PHYSICIAN_CLAIM_LINES: list[tuple[str, tuple[str, ...]]] = [
 DEDUCT_PATIENT_NAME = "QUIMBY, THEODORA"
 DEDUCT_PATIENT_MBI = _mbi("0201")
 DEDUCT_PATIENT_ACCT = "QUIMBT"
+
+
+# --- Third fixture: an OA-18 exact-duplicate remittance --------------------
+#
+# A later remittance that re-adjudicates the same visits as the deductible
+# fixture, this time as exact duplicates (reason code 18, group OA) at $0.00.
+# Medicare pays $0 on a duplicate because the original already paid, so such an
+# occurrence must never overwrite the real payment.
+#
+# It also carries one genuinely NEW, genuinely paid visit on a date the earlier
+# remit did not cover, and one duplicate for a visit the earlier remit never
+# reported at all (so "duplicate only" has something to flag).
+
+DUPLICATE_HEADER_DATE = "08/27/26"  # later than the paying remit's 07/20/26
+DUPLICATE_CHECK_EFT = "900000003"
+
+#: Dates re-reported as OA-18 duplicates -- every date from DEDUCTIBLE_LINES.
+DUPLICATE_OF_DATES: list[str] = [iso for iso, *_ in DEDUCTIBLE_LINES]
+
+#: A real, non-duplicate payment on a date the paying remit did not include.
+DUPLICATE_FIXTURE_NEW_VISIT = ("2026-02-25", 0.00, 26.60, 104.27, 2.13)
+
+#: A visit seen ONLY as a duplicate: the remit that paid it was never uploaded.
+DUPLICATE_ONLY_DATE = "2026-07-07"

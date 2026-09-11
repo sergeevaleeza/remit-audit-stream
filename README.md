@@ -400,6 +400,18 @@ Rules that keep this safe:
 - **Several remits in one upload** are ordered by header `DATE:` and reconciled
   to the newest; the preview notes how many contributed. Within a single
   remittance the service lines of a visit are still summed as before.
+- **Exact duplicates never win.** Medicare reason code **18** (`OA-18` /
+  `CO-18`, *"exact duplicate claim/service"*) marks a claim re-adjudicated at
+  `$0.00` because the original already paid. Such an occurrence is **not
+  authoritative**: the amounts come from the newest *non-duplicate* remit, in
+  any upload order, so a duplicate can never zero out a real payment. The
+  preview says so — *"OA-18 duplicate from EFT x ignored; kept payment from
+  EFT y"* — and the audit trail still lists both EFTs. If a visit is seen
+  *only* as a duplicate (the paying remit was not uploaded) it is flagged
+  *Duplicate only (OA-18) … verify* rather than recorded as a real `$0.00`.
+  The discriminator is the **reason code, not the amount**: a `$0.00` line
+  carrying `CO-45` because the deductible consumed the allowed amount is a
+  genuine zero and is unaffected.
 - Re-running an applied update is a no-op: the row now agrees with the remit,
   so it classifies as *Skip — already recorded*.
 - **Names are compared, not rewritten.** Generational suffixes (`Jr`, `Sr`,

@@ -8,7 +8,7 @@ token, the ordered list of dollar amounts) rather than by character offset.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Iterable, Sequence
 
@@ -55,6 +55,29 @@ POS_TELEHEALTH = "10"
 #: The telehealth modifier printed after PROC.
 MODIFIER_TELEHEALTH = "95"
 
+# Group/reason adjustment codes: `CO-45`, `OA-18`, `CO-253`, `PR-1` ...
+_ADJ_CODE_RE = re.compile(r"\b([A-Z]{2})-(\d+)\b")
+
+# A continuation line: the indented `REM:` / `CO-###` rows that belong to the
+# service line above them. They carry reason codes (and sometimes an amount).
+_CONTINUATION_RE = re.compile(r"^(?:REM:|[A-Z]{2}-\d+\b)")
+
+#: Medicare reason code 18 -- "Exact duplicate claim/service". Printed as
+#: `OA-18` or `CO-18`. The duplicate is adjudicated at $0 because the original
+#: already paid, so such an occurrence is NOT authoritative: it must never
+#: contribute, overwrite, zero or downgrade a real payment.
+DUPLICATE_REASON_CODE = "18"
+
+
+def adjustment_codes(text: str) -> tuple[str, ...]:
+    """Every `XX-nnn` group/reason token in a line, in order of appearance."""
+    return tuple(f"{group}-{reason}" for group, reason in _ADJ_CODE_RE.findall(text))
+
+
+def marks_duplicate(codes: Iterable[str]) -> bool:
+    """True when any code is reason 18, whatever its group prefix."""
+    return any(code.split("-", 1)[-1] == DUPLICATE_REASON_CODE for code in codes)
+
 # Evaluation & management codes sort before psychotherapy add-ons.
 _EM_PREFIX = "99"
 
@@ -93,10 +116,17 @@ class ServiceLine:
     #: modifiers, used to tell a telehealth encounter from an in-office one.
     pos: str | None = None
     modifiers: tuple[str, ...] = ()
+    #: Group/reason codes from this line **and** its continuation lines.
+    codes: tuple[str, ...] = ()
 
     @property
     def telehealth(self) -> bool:
         return self.pos == POS_TELEHEALTH and MODIFIER_TELEHEALTH in self.modifiers
+
+    @property
+    def is_duplicate(self) -> bool:
+        """Reason 18: an exact-duplicate claim, adjudicated at $0."""
+        return marks_duplicate(self.codes)
 
 
 @dataclass
@@ -123,6 +153,34 @@ class Visit:
     #: These are consistent across a visit's CPT lines on these remits.
     pos: str | None = None
     modifiers: set[str] = field(default_factory=set)
+
+    #: Group/reason codes seen on this occurrence's service lines.
+    codes: set[str] = field(default_factory=set)
+    #: True when this occurrence is an exact-duplicate adjudication (reason
+    #: 18). Such an occurrence is adjudicated at $0 because the original
+    #: already paid, so it is never allowed to supply the visit's amounts.
+    is_duplicate: bool = False
+    #: True when *every* occurrence of this visit was a duplicate, i.e. the
+    #: remittance that actually paid was not uploaded.
+    duplicate_only: bool = False
+    #: EFT numbers of duplicate occurrences whose amounts were discarded, and
+    #: the EFT that did supply the amounts.
+    ignored_duplicate_efts: set[str] = field(default_factory=set)
+    authoritative_eft: str | None = None
+
+    @property
+    def duplicate_note(self) -> str:
+        """Preview text explaining a discarded duplicate, if there was one."""
+        if self.duplicate_only:
+            return (
+                "Duplicate only (OA-18) - original paying remit not uploaded; "
+                "verify before recording"
+            )
+        if not self.ignored_duplicate_efts:
+            return ""
+        ignored = ", ".join(sorted(self.ignored_duplicate_efts))
+        kept = self.authoritative_eft or "the paying remit"
+        return f"OA-18 duplicate from EFT {ignored} ignored; kept payment from EFT {kept}"
 
     @property
     def telehealth(self) -> bool:
@@ -311,6 +369,7 @@ def parse_service_line(line: str, patient: str, source_file: str,
         deduct=amounts[_DEDUCT_INDEX],
         coins=amounts[_COINS_INDEX],
         prov_pd=amounts[_PROV_PD_INDEX],
+        codes=adjustment_codes(line),
         source_file=source_file,
         check_eft=check_eft,
         pos=pos,
@@ -351,6 +410,22 @@ def parse_document(file_obj, filename: str = "remit.pdf") -> RemitDocument:
         parsed = parse_service_line(line, current_patient, filename, check_eft)
         if parsed is not None:
             service_lines.append(parsed)
+            continue
+
+        # A continuation line (`REM: …` or a bare `CO-### …`) carries reason
+        # codes that belong to the service line above it. It is still never
+        # treated as a service line -- only its codes are folded upward, so
+        # amounts are unaffected.
+        if service_lines and _CONTINUATION_RE.match(line):
+            previous = service_lines[-1]
+            extra = tuple(
+                code for code in adjustment_codes(line)
+                if code not in previous.codes
+            )
+            if extra:
+                service_lines[-1] = replace(
+                    previous, codes=previous.codes + extra
+                )
 
     return RemitDocument(
         filename=filename,
@@ -401,40 +476,68 @@ def aggregate_visits(documents: Sequence[RemitDocument]) -> list[Visit]:
             if line.pos and visit.pos is None:
                 visit.pos = line.pos
             visit.modifiers.update(line.modifiers)
+            visit.codes.update(line.codes)
+            if line.is_duplicate:
+                visit.is_duplicate = True
         per_document.append((doc, bucket))
 
-    # Reconcile across documents: newest remit wins.
-    merged: dict[tuple[str, date, str], Visit] = {}
+    # Collect every occurrence of each visit, then reconcile them together.
+    occurrences: dict[tuple[str, date, str], list[Visit]] = {}
     for _, bucket in per_document:
         for key, candidate in bucket.items():
-            current = merged.get(key)
-            if current is None:
-                merged[key] = candidate
-                continue
+            occurrences.setdefault(key, []).append(candidate)
 
-            older, newer = _order_by_remit_date(current, candidate)
-            newer.remit_count = current.remit_count + candidate.remit_count
-            newer.superseded_payments = (
-                older.superseded_payments + newer.superseded_payments + [older.payment]
-            )
-            # Every contributing check number is kept so the audit trail on the
-            # row shows the full history, not just the winning remit.
-            newer.check_efts = current.check_efts | candidate.check_efts
-            newer.source_files = current.source_files | candidate.source_files
-            merged[key] = newer
-
+    merged = {key: _reconcile(group) for key, group in occurrences.items()}
     return sorted(merged.values(), key=lambda v: (v.patient, v.service_date, v.npi))
 
 
-def _order_by_remit_date(first: Visit, second: Visit) -> tuple[Visit, Visit]:
-    """(older, newer) by remit header date; a dated remit beats an undated one."""
-    if first.billed_date is None:
-        return first, second
-    if second.billed_date is None:
-        return second, first
-    if second.billed_date >= first.billed_date:
-        return first, second
-    return second, first
+def _remit_sort_key(visit: Visit) -> date:
+    """Undated remits sort oldest, so any dated one outranks them."""
+    return visit.billed_date or date.min
+
+
+def _reconcile(group: list[Visit]) -> Visit:
+    """Pick the occurrence that supplies a visit's amounts.
+
+    Reason-18 occurrences are *exact duplicates*, adjudicated at $0 because the
+    original already paid. They are therefore not authoritative: the amounts
+    come from the newest **non-duplicate** occurrence, whatever order the
+    remittances were uploaded in. Only when every occurrence is a duplicate --
+    the paying remittance was never uploaded -- is the visit flagged for a human
+    rather than recorded as a real $0.00.
+
+    Among non-duplicate occurrences the existing `replace_with_latest`
+    behaviour is unchanged: the newest remit restates the claim.
+    """
+    authoritative = [visit for visit in group if not visit.is_duplicate]
+    duplicates = [visit for visit in group if visit.is_duplicate]
+
+    pool = authoritative or duplicates
+    ordered = sorted(pool, key=_remit_sort_key)
+    winner = ordered[-1]
+
+    winner.remit_count = len(group)
+    winner.superseded_payments = [visit.payment for visit in ordered[:-1]]
+    winner.duplicate_only = not authoritative
+    winner.authoritative_eft = (
+        sorted(winner.check_efts)[0] if winner.check_efts and authoritative else None
+    )
+
+    # The audit trail lists every EFT that mentioned this visit, including the
+    # duplicates -- only their *amounts* are discarded, not the fact of them.
+    for visit in group:
+        if visit is winner:
+            continue
+        winner.check_efts |= visit.check_efts
+        winner.source_files |= visit.source_files
+        winner.codes |= visit.codes
+
+    if authoritative:
+        winner.ignored_duplicate_efts = {
+            eft for visit in duplicates for eft in visit.check_efts
+        }
+
+    return winner
 
 
 def parse_remittances(files: Sequence[tuple[object, str]]) -> tuple[list[RemitDocument], list[Visit]]:
