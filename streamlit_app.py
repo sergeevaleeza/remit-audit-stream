@@ -194,7 +194,7 @@ def render_employee_preview(changes) -> None:
         rows = [c for c in changes if c.sheet == sheet]
         if not rows:
             continue
-        note = " — fill-only, never appended to" if sheet not in EMPLOYEE_APPEND_SHEETS else ""
+        note = "" if sheet in EMPLOYEE_APPEND_SHEETS else " — fill-only"
         with st.expander(f"{sheet}{note} ({len(rows)} row(s))", expanded=False):
             st.dataframe(
                 pd.DataFrame([
@@ -207,6 +207,8 @@ def render_employee_preview(changes) -> None:
                         "Payment": c.payment if c.payment is not None else "—",
                         "→ column": c.payment_column or "—",
                         "Row": c.row_num or "(new)",
+                        "Processed On": c.processed_on or "—",
+                        "Remit Check/EFT #": c.check_eft or "—",
                         "Note": c.note or "—",
                     }
                     for c in rows

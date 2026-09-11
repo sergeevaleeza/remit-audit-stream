@@ -212,7 +212,29 @@ EMPLOYEE_COL_COPAY_EOB = "Co-pay by EOB"
 EMPLOYEE_COL_DATE = "Date of Session"
 
 #: Tabs the app may append brand-new visits to. Marcia's tab is fill-only.
-EMPLOYEE_APPEND_SHEETS = ("Ana", "Oxana")
+#: Tabs the app may append new visits to. All three behave the same way: a
+#: patient already present in a tab gets their further sessions appended to
+#: the end of it.
+EMPLOYEE_APPEND_SHEETS = ("Ana", "Marcia", "Oxana")
+
+#: Tab that optionally absorbs visits for patients who appear in NO provider
+#: tab. Off by default -- see MARCIA_CATCH_ALL_UNASSIGNED below.
+EMPLOYEE_CATCH_ALL_SHEET = "Marcia"
+
+#: When True, a schedule visit whose patient is in no provider tab is appended
+#: to the end of Marcia's tab and flagged *auto-placed*. When False (default)
+#: it is listed as *Unassigned - needs manual placement* and nothing is written.
+#:
+#: WARNING: most visits bill under the supervising physician's NPI
+#: (incident-to), so a large share of "no tab" patients are that physician's
+#: OWN direct patients who legitimately belong in no associate's tab. Turning
+#: this on sweeps all of them into Marcia's tab, turning it into an overflow
+#: bucket. Leave it False unless that is explicitly what is wanted.
+MARCIA_CATCH_ALL_UNASSIGNED = False
+
+#: Audit columns the app maintains on each provider tab, appended after that
+#: tab's existing headers (respecting its own header-row position).
+EMPLOYEE_AUDIT_COLUMNS = (COL_PROCESSED_ON, COL_CHECK_EFT)
 
 #: `all_matching` syncs every matching schedule visit into the tabs, deduped
 #: by patient + Date of Session so nothing is added twice.
@@ -231,6 +253,10 @@ EMP_ACTION_NO_MATCH = "No Schedule match"
 EMP_ACTION_MISMATCH = "Practitioner mismatch - needs review"
 EMP_ACTION_UNASSIGNED = "Unassigned - needs manual placement"
 EMP_ACTION_NOTHING = "Nothing to fill"
+
+#: Only reachable with MARCIA_CATCH_ALL_UNASSIGNED on: a no-tab patient swept
+#: into the catch-all tab. Always surfaced for review, never silent.
+EMP_ACTION_AUTO_PLACED = "Append (auto-placed, unassigned) - review"
 
 # --- Name normalisation -----------------------------------------------------
 

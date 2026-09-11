@@ -16,6 +16,7 @@ import pdfplumber
 
 from .config import (
     CENTURY_PREFIX,
+    CHECK_EFT_JOINER,
     DATE_FMT,
     INSURANCE_VALUE,
     NPI_TO_DOCTOR,
@@ -164,9 +165,21 @@ class Visit:
     #: remittance that actually paid was not uploaded.
     duplicate_only: bool = False
     #: EFT numbers of duplicate occurrences whose amounts were discarded, and
-    #: the EFT that did supply the amounts.
+    #: of the occurrence(s) that did supply the amounts.
     ignored_duplicate_efts: set[str] = field(default_factory=set)
-    authoritative_eft: str | None = None
+    authoritative_efts: set[str] = field(default_factory=set)
+
+    @property
+    def authoritative_eft(self) -> str | None:
+        """The paying remit's EFT -- never a duplicate's.
+
+        Several authoritative remits can contribute (a restatement), in which
+        case they are joined, so the audit trail records every remit whose
+        amounts were actually used.
+        """
+        if not self.authoritative_efts:
+            return None
+        return CHECK_EFT_JOINER.join(sorted(self.authoritative_efts))
 
     @property
     def duplicate_note(self) -> str:
@@ -519,9 +532,10 @@ def _reconcile(group: list[Visit]) -> Visit:
     winner.remit_count = len(group)
     winner.superseded_payments = [visit.payment for visit in ordered[:-1]]
     winner.duplicate_only = not authoritative
-    winner.authoritative_eft = (
-        sorted(winner.check_efts)[0] if winner.check_efts and authoritative else None
-    )
+    # Captured BEFORE the union below, so a duplicate's EFT can never leak in.
+    winner.authoritative_efts = {
+        eft for visit in authoritative for eft in visit.check_efts
+    }
 
     # The audit trail lists every EFT that mentioned this visit, including the
     # duplicates -- only their *amounts* are discarded, not the fact of them.

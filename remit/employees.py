@@ -29,13 +29,18 @@ from openpyxl.worksheet.worksheet import Worksheet
 from .config import (
     DATE_FMT,
     EMP_ACTION_APPEND,
+    EMP_ACTION_AUTO_PLACED,
     EMP_ACTION_FILL,
     EMP_ACTION_MISMATCH,
     EMP_ACTION_NO_MATCH,
     EMP_ACTION_NOTHING,
     EMP_ACTION_UNASSIGNED,
     EMPLOYEE_APPEND_SHEETS,
+    EMPLOYEE_AUDIT_COLUMNS,
+    EMPLOYEE_CATCH_ALL_SHEET,
     EMPLOYEE_COL_COPAY_EOB,
+    COL_CHECK_EFT,
+    COL_PROCESSED_ON,
     EMPLOYEE_COL_DATE,
     EMPLOYEE_COL_INSURANCE,
     EMPLOYEE_HEADER_SEARCH_ROWS,
@@ -43,6 +48,7 @@ from .config import (
     EMPLOYEE_PAYMENT_COLUMN,
     EMPLOYEE_SHEETS,
     FALLBACK_TO_COMMENT_FOR_NEW,
+    MARCIA_CATCH_ALL_UNASSIGNED,
     NAME_AUTO_MATCH_SCORE,
 )
 from .matching import (
@@ -176,14 +182,25 @@ class EmployeeChange:
     fills: dict[int, Any] = field(default_factory=dict)
     note: str = ""
     accepted: bool = True
+    #: Audit stamps written to this tab's own columns for rows touched now.
+    processed_on: str = ""
+    check_eft: str = ""
 
     @property
     def needs_review(self) -> bool:
-        return self.action in (EMP_ACTION_MISMATCH, EMP_ACTION_UNASSIGNED)
+        return self.action in (
+            EMP_ACTION_MISMATCH, EMP_ACTION_UNASSIGNED, EMP_ACTION_AUTO_PLACED,
+        )
 
     @property
     def writes(self) -> bool:
-        return self.action in (EMP_ACTION_FILL, EMP_ACTION_APPEND)
+        return self.action in (
+            EMP_ACTION_FILL, EMP_ACTION_APPEND, EMP_ACTION_AUTO_PLACED,
+        )
+
+    @property
+    def appends(self) -> bool:
+        return self.action in (EMP_ACTION_APPEND, EMP_ACTION_AUTO_PLACED)
 
 
 def load_employees_workbook(data: bytes) -> openpyxl.Workbook:
@@ -254,6 +271,9 @@ class ScheduleVisit:
     copay: Any
     payment: Any
     comment: str = ""
+    #: The paying remit's check/EFT number for this visit -- per the OA-18
+    #: rule this is never a duplicate's number.
+    check_eft: str = ""
 
     @property
     def date_str(self) -> str:
@@ -270,6 +290,10 @@ def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
     from .config import COL_COMMENT, COL_COPAY, COL_PAYMENT
 
     pending: dict[int, dict[str, Any]] = {}
+    # The paying remit's EFT for each schedule row this run touched. Taken
+    # from the visit's authoritative occurrence, so an OA-18 duplicate's
+    # number can never end up in the employees audit column.
+    paying_eft: dict[int, str] = {}
     for change in changes:
         if not change.accepted or change.row_num is None:
             continue
@@ -277,11 +301,13 @@ def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
         merged.update(change.updates)
         if merged:
             pending.setdefault(change.row_num, {}).update(merged)
+        if merged and change.visit is not None and change.visit.authoritative_eft:
+            paying_eft[change.row_num] = change.visit.authoritative_eft
 
     visits: list[ScheduleVisit] = []
     seen: set[tuple[tuple[str, str], date]] = set()
 
-    def add(patient, session_date, insurance, copay, payment, comment):
+    def add(patient, session_date, insurance, copay, payment, comment, check_eft=""):
         if is_blank(patient) or session_date is None:
             return
         from .matching import split_name
@@ -298,6 +324,7 @@ def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
                 copay=copay,
                 payment=payment,
                 comment="" if is_blank(comment) else str(comment).strip(),
+                check_eft="" if is_blank(check_eft) else str(check_eft).strip(),
             )
         )
 
@@ -310,6 +337,9 @@ def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
             overlay.get(COL_COPAY, row.copay),
             overlay.get(COL_PAYMENT, row.payment),
             overlay.get(COL_COMMENT, row.comment),
+            # This run's paying remit if it touched the row, else whatever the
+            # schedule already recorded from an earlier run.
+            paying_eft.get(row.row_num) or row.check_eft,
         )
 
     # Rows this run appends do not exist in `rows` yet.
@@ -325,6 +355,7 @@ def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
             change.visit.copay,
             change.visit.payment,
             change.visit.doctor,
+            change.visit.authoritative_eft or "",
         )
 
     return visits
@@ -387,8 +418,10 @@ def _mapped_fills(sheet: EmployeeSheet, row_values: dict[str, Any],
 
 
 def plan_employee_changes(sheets: dict[str, EmployeeSheet],
-                          visits: Sequence[ScheduleVisit]) -> list[EmployeeChange]:
+                          visits: Sequence[ScheduleVisit],
+                          today: date | None = None) -> list[EmployeeChange]:
     """Decide what each provider sheet should get from the schedule."""
+    stamp = (today or date.today()).strftime(DATE_FMT)
     changes: list[EmployeeChange] = []
     matched_visits: set[tuple[str, date]] = set()
 
@@ -491,7 +524,6 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
                 continue
 
         if target not in EMPLOYEE_APPEND_SHEETS:
-            # Marcia's tab is fill-only by policy.
             changes.append(EmployeeChange(
                 sheet=target,
                 action=EMP_ACTION_UNASSIGNED,
@@ -500,7 +532,7 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
                 insurance=visit.insurance,
                 copay=visit.copay,
                 payment=visit.payment,
-                note=f"{target} is fill-only; add this session by hand if it belongs here",
+                note=f"{target} does not accept appends; add this session by hand",
                 accepted=False,
             ))
             continue
@@ -536,7 +568,20 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
             accepted=True,
         ))
 
+    for change in changes:
+        change.processed_on = stamp
+        change.check_eft = _eft_for(change, visits)
+
     return changes
+
+
+def _eft_for(change: EmployeeChange, visits: Sequence[ScheduleVisit]) -> str:
+    """The paying remit's EFT for the schedule visit behind this change."""
+    for visit in visits:
+        if (visit.date_str == change.session_date
+                and _same_person(change.patient, visit.patient)):
+            return visit.check_eft
+    return ""
 
 
 def _key_of(patient: str):
@@ -567,6 +612,33 @@ def _unassigned(visit: ScheduleVisit, sheets: dict[str, EmployeeSheet]) -> Emplo
                 note=f"new patient routed by Comment '{visit.comment}'",
                 accepted=True,
             )
+
+    # Optional overflow bucket, OFF by default.
+    #
+    # WARNING: most visits bill under the supervising physician's NPI
+    # (incident-to), so a large share of "no tab" patients are that
+    # physician's OWN direct patients, who legitimately belong in no
+    # associate's tab. Turning this on sweeps every one of them into the
+    # catch-all tab. It is always flagged for review, never applied silently.
+    catch_all = sheets.get(EMPLOYEE_CATCH_ALL_SHEET)
+    if MARCIA_CATCH_ALL_UNASSIGNED and catch_all is not None:
+        return EmployeeChange(
+            sheet=catch_all.name,
+            action=EMP_ACTION_AUTO_PLACED,
+            patient=visit.patient,
+            session_date=visit.date_str,
+            insurance=visit.insurance,
+            copay=visit.copay,
+            payment=visit.payment,
+            payment_column=EMPLOYEE_PAYMENT_COLUMN.get(catch_all.name, ""),
+            fills=_append_values(catch_all, visit),
+            note=(
+                f"Patient is in no provider tab; auto-placed in "
+                f"{catch_all.name} by MARCIA_CATCH_ALL_UNASSIGNED - verify, "
+                "they may be the physician's own direct patient"
+            ),
+            accepted=False,
+        )
 
     return EmployeeChange(
         sheet="",
@@ -608,6 +680,53 @@ def _copy_style(source_cell, target_cell) -> None:
         target_cell.protection = copy(source_cell.protection)
 
 
+def _first_empty_header_column(worksheet: Worksheet, header_row: int) -> int:
+    """First column whose header cell on this tab's header row is empty."""
+    column = 1
+    while not is_blank(worksheet.cell(row=header_row, column=column).value):
+        column += 1
+    return column
+
+
+def ensure_audit_columns(worksheet: Worksheet, sheet: EmployeeSheet) -> dict[str, int]:
+    """Find or create this tab's audit columns, honouring its header row.
+
+    Ana and Marcia carry their headers on row 1, Oxana on row 2, so the new
+    headers land on that tab's own header row and inherit its formatting.
+    """
+    resolved: dict[str, int] = {}
+    template = worksheet.cell(row=sheet.header_row, column=max(sheet.columns.values()))
+
+    for header in EMPLOYEE_AUDIT_COLUMNS:
+        existing = column_for(sheet.columns, header)
+        if existing is not None:
+            resolved[header] = existing
+            continue
+        column = _first_empty_header_column(worksheet, sheet.header_row)
+        cell = worksheet.cell(row=sheet.header_row, column=column, value=header)
+        _copy_style(template, cell)
+        sheet.columns[header_key(header)] = column
+        resolved[header] = column
+
+    return resolved
+
+
+def _stamp_audit(worksheet: Worksheet, columns: dict[str, int],
+                 row_num: int, change: EmployeeChange) -> None:
+    """Write this run's audit stamps onto a row the app filled or appended.
+
+    These are the app's own columns, so a row touched this run is (re)stamped.
+    Rows the app did not touch are never written to.
+    """
+    for header, value in (
+        (COL_PROCESSED_ON, change.processed_on),
+        (COL_CHECK_EFT, change.check_eft),
+    ):
+        column = columns.get(header)
+        if column and value:
+            worksheet.cell(row=row_num, column=column).value = value
+
+
 def _last_data_row(worksheet: Worksheet, sheet: EmployeeSheet) -> int:
     patient_column = sheet.patient_column
     last = sheet.header_row
@@ -628,6 +747,12 @@ def apply_employee_changes(workbook: openpyxl.Workbook,
 
     accepted = [c for c in changes if c.accepted and c.writes and c.fills]
 
+    # The audit headers are created only on tabs this run actually writes to.
+    audit: dict[str, dict[str, int]] = {}
+    for name in {c.sheet for c in accepted}:
+        if name in sheets:
+            audit[name] = ensure_audit_columns(workbook[name], sheets[name])
+
     for change in accepted:
         if change.action != EMP_ACTION_FILL or change.row_num is None:
             continue
@@ -643,12 +768,11 @@ def apply_employee_changes(workbook: openpyxl.Workbook,
             wrote_any = True
         if wrote_any:
             filled_rows += 1
+            _stamp_audit(worksheet, audit.get(change.sheet, {}),
+                         change.row_num, change)
 
     for name in EMPLOYEE_SHEETS:
-        appends = [
-            c for c in accepted
-            if c.action == EMP_ACTION_APPEND and c.sheet == name
-        ]
+        appends = [c for c in accepted if c.appends and c.sheet == name]
         if not appends or name not in sheets:
             continue
         worksheet = workbook[name]
@@ -662,6 +786,7 @@ def apply_employee_changes(workbook: openpyxl.Workbook,
                     _copy_style(worksheet.cell(row=template_row, column=column), target)
                 if column in change.fills:
                     target.value = change.fills[column]
+            _stamp_audit(worksheet, audit.get(name, {}), next_row, change)
             appended_rows += 1
             next_row += 1
 

@@ -143,11 +143,13 @@ def test_fill_writes_only_the_blank_cells(schedule_bytes, plan):
     updated, stats = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
 
-    assert worksheet.cell(row=9, column=5).value == 186.31      # Payment
-    assert worksheet.cell(row=9, column=6).value == 47.53       # Co-pay
-    assert worksheet.cell(row=9, column=9).value == "Dr. A"     # Comment
-    assert worksheet.cell(row=9, column=10).value == "F41.1, F32.9"  # DX kept
-    assert worksheet.cell(row=9, column=11).value == "99213/90836"   # CPT kept
+    # Rows shift as new visits are inserted, so locate this one by identity.
+    row = find_row(worksheet, "Castellano, Miguel", date(2026, 3, 26))
+    assert row["Payment"] == 186.31
+    assert row["Co-pay"] == 47.53
+    assert row["Comment"] == "Dr. A"
+    assert row["DX"] == "F41.1, F32.9"        # untouched
+    assert row["CPT Code"] == "99213/90836"   # untouched
     assert stats["filled_rows"] >= 1
 
 
@@ -159,7 +161,7 @@ def test_billed_placeholder_is_never_overwritten(schedule_bytes, plan):
 
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     worksheet = load_schedule_workbook(updated.getvalue())[SHEET_NAME]
-    assert worksheet.cell(row=9, column=4).value == "2/32/26"
+    assert find_row(worksheet, "Castellano, Miguel", date(2026, 3, 26))["Billed"] == "2/32/26"
 
 
 def test_blank_billed_would_be_filled(visits, schedule):

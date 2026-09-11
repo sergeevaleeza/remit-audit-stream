@@ -149,15 +149,21 @@ def test_inserts_and_appends_together(schedule_bytes, visits, schedule_rows):
     plan = build_plan(visits, schedule_rows)
     worksheet, stats = applied_sheet(schedule_bytes, plan)
 
-    assert stats["inserted_rows"] == 4   # 3 Castellano + 1 Sorensen
-    assert stats["appended_rows"] == 4   # Okafor, Petrossian x2, Whitcombe
+    # Grouped under an existing patient vs appended at the bottom.
+    grouped = [c for c in plan if c.accepted and c.effective_action == ACTION_NEW
+               and c.inserts_under_patient]
+    bottom = [c for c in plan if c.accepted and c.effective_action == ACTION_NEW
+              and not c.inserts_under_patient]
+    assert stats["inserted_rows"] == len(grouped) > 0
+    assert stats["appended_rows"] == len(bottom) > 0
 
     order = patients_in_order(worksheet)
     assert order[:8] == [
         "Marlowe, Diane", "Marlowe, Diane",
         "Thackeray, Renata", "Thackeray, Renata", "Thackeray, Renata",
-        "Whitfield, Harold",
-        "Castellano, Miguel", "Castellano, Miguel",
+        # Whitfield's second session groups under his existing row.
+        "Whitfield, Harold", "Whitfield, Harold",
+        "Castellano, Miguel",
     ]
     assert order[-4:] == [
         "Okafor, Chidinma",

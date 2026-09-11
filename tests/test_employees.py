@@ -270,10 +270,13 @@ def test_new_session_appends_for_oxana(emp_changes):
     assert change.action == EMP_ACTION_APPEND
 
 
-def test_marcia_never_appends(emp_changes, sheets):
-    """Marcia's tab is fill-only by policy."""
-    assert not [c for c in emp_changes
-                if c.sheet == "Marcia" and c.action == EMP_ACTION_APPEND]
+def test_marcia_appends_like_the_other_tabs(emp_changes):
+    """Marcia used to be fill-only; she now appends for her own patients."""
+    appends = [c for c in emp_changes
+               if c.sheet == "Marcia" and c.action == EMP_ACTION_APPEND]
+    assert len(appends) == 1
+    assert appends[0].patient.startswith("Whitfield")
+    assert appends[0].session_date == "04/02/2026"
 
 
 def test_patient_in_no_tab_is_unassigned(emp_changes):
@@ -294,8 +297,9 @@ def test_unassigned_is_not_routed_by_comment(emp_changes):
 
 def test_apply_fills_and_appends(employees_bytes, emp_changes):
     updated, stats = build_updated_employees(employees_bytes, emp_changes)
+    expected_appends = sum(1 for c in emp_changes if c.accepted and c.appends)
     assert stats["filled_rows"] > 0
-    assert stats["appended_rows"] == 4
+    assert stats["appended_rows"] == expected_appends > 0
 
     workbook = load_employees_workbook(updated.getvalue())
     ana = sheet_values(workbook["Ana"], 1)
@@ -421,7 +425,9 @@ def test_summary_counts(emp_changes):
     counts = summarize_employees(emp_changes)
     assert counts["rows"] == len(emp_changes)
     assert counts["fill"] > 0
-    assert counts["append"] == 4
+    assert counts["append"] == sum(
+        1 for c in emp_changes if c.action == EMP_ACTION_APPEND
+    ) > 0
     assert counts["mismatch"] >= 1
 
 

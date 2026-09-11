@@ -212,14 +212,41 @@ schedule's `Comment`.
    **practitioner mismatch — needs review** instead of filled. A blank
    `Comment`, or one naming a physician (`Dr. …`) rather than a tab, is **not**
    a conflict — it carries no signal about which tab is right.
-3. **Append** a patient's further sessions to the tab they already appear in —
-   **Ana and Oxana only**. **Marcia's tab is fill-only and is never appended
-   to.** If a patient appears in several tabs, `Comment` routes them; if it
-   cannot, the visit is flagged.
+3. **Append** a patient's further sessions to the tab they already appear in.
+   **All three tabs behave the same way** — Ana, Marcia and Oxana each fill
+   their existing rows and append new sessions to the end of the tab. If a
+   patient appears in several tabs, `Comment` routes them; if it cannot, the
+   visit is flagged.
 4. **Unassigned.** A visit for a patient in no tab is listed as
    *unassigned — needs manual placement*, never guessed at. Set
    `FALLBACK_TO_COMMENT_FOR_NEW = True` to append such patients to the tab
    their `Comment` names.
+
+#### Optional catch-all (`MARCIA_CATCH_ALL_UNASSIGNED`, default `False`)
+
+With this on, a visit whose patient is in **no** provider tab is appended to
+the end of Marcia's tab instead of being listed as unassigned, flagged
+*Append (auto-placed, unassigned) — review* and never accepted by default.
+
+> **Warning.** Most visits bill under the supervising physician's NPI
+> (incident-to), so a large share of "no tab" patients are that physician's
+> **own direct patients**, who legitimately belong in no associate's tab.
+> Turning this on sweeps every one of them into Marcia's tab, making it an
+> overflow bucket. Leave it `False` unless that is explicitly wanted.
+
+#### Audit columns on each tab
+
+Every provider tab gains two columns after its existing headers, on **that
+tab's own header row** (Ana/Marcia row 1, Oxana row 2):
+
+| Column | Value |
+|---|---|
+| `Processed On` | the date the app filled or appended the row, `MM/DD/YYYY` |
+| `Remit Check/EFT #` | the **paying** remit's check/EFT number — per the OA-18 rule this is never a duplicate's; several authoritative remits are joined with `; ` |
+
+They are written only for rows the app fills or appends in that run; every
+other row is left untouched. The headers are created only on tabs the run
+actually writes to, and are reused rather than duplicated on later runs.
 
 Dedup is by patient + Date of Session, so re-running adds nothing.
 

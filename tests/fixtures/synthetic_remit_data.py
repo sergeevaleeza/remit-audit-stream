@@ -128,6 +128,14 @@ ROSTER: list[Patient] = [
                 "WHITFIELD, HAROLD", _mbi("0003"), "WHITFH", "9999900000004",
                 [ServiceLineSpec("99214", "2026-03-04")],
             ),
+            # A second date, absent from both the schedule and Marcia's tab.
+            # Marcia already has this patient, so this session is appended to
+            # the end of her tab -- the Marcia append path.
+            ClaimBlock(
+                "WHITFIELD, HAROLD", _mbi("0003"), "WHITFH", "9999900000010",
+                [ServiceLineSpec("99213", "2026-04-02"),
+                 ServiceLineSpec("90833", "2026-04-02")],
+            ),
         ],
     ),
     # Empty Payment in the schedule for 03/26 -> Fill path. Spans two claim

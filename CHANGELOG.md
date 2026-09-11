@@ -3,6 +3,82 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] — 2026-09-10
+
+Marcia's tab now appends as well as fills, and every provider tab gains
+`Processed On` / `Remit Check/EFT #` audit columns. 381 tests pass (was 344).
+The Mutual workbook remains a read-only DX source and is never modified.
+
+### Changed — Marcia fills *and* appends
+
+Reverses the earlier "Marcia never appends" rule. All three tabs now behave
+identically:
+
+- **Fill** existing rows by patient name (suffix-aware) + `Date of Session`.
+- **Append** a patient's further sessions — those whose `Date of Session` is
+  not yet in the tab — to the **end** of that tab, filling the mapped columns
+  and copying styling from the last existing data row.
+- The `Comment` cross-check is unchanged: a schedule `Comment` naming a
+  *different provider tab* still flags *practitioner mismatch — needs review*
+  rather than placing the row silently. A `Comment` naming a physician
+  (`Dr. …`) is still not a conflict.
+- Dedup is still by patient + `Date of Session`, so re-runs add nothing.
+
+`EMPLOYEE_APPEND_SHEETS` is now all three tabs.
+
+### Added — optional catch-all for no-tab patients
+
+`MARCIA_CATCH_ALL_UNASSIGNED`, **default `False`**. Off, a visit for a patient
+in no provider tab is listed *Unassigned — needs manual placement* exactly as
+before. On, it is appended to the end of Marcia's tab as
+*Append (auto-placed, unassigned) — review*, which is never accepted by
+default.
+
+> **Warning, also carried as a comment in `remit/employees.py`.** Most visits
+> bill under the supervising physician's NPI (incident-to), so a large share of
+> "no tab" patients are that physician's **own direct patients**, who
+> legitimately belong in no associate's tab. Turning this on sweeps all of them
+> into Marcia's tab, turning it into an overflow bucket. Keep it `False` unless
+> that behaviour is explicitly wanted.
+
+### Added — `Processed On` and `Remit Check/EFT #` on every provider tab
+
+- Created at the first empty columns after that tab's existing headers, on
+  **that tab's own header row** — Ana and Marcia row 1, Oxana row 2 — inheriting
+  the header row's formatting. Resolved by header text, case-insensitively and
+  with internal whitespace collapsed, like every other employee-sheet column.
+- `Processed On` is the run date in `DATE_FMT` (`MM/DD/YYYY`).
+- `Remit Check/EFT #` is the **paying** remit's number. Per the OA-18 rule an
+  exact-duplicate occurrence supplies no amounts, so it supplies no audit
+  number either; several *authoritative* remits are joined with `; `.
+- Written only for rows the app fills or appends in that run. Rows it does not
+  touch are left completely alone, and the headers are created only on tabs the
+  run actually writes to.
+- Both values appear in the per-provider preview table.
+
+### Fixed
+
+- `Visit.authoritative_eft` previously took the first of the visit's *merged*
+  check numbers, which could be a discarded duplicate's. The authoritative EFTs
+  are now captured before the audit-trail union, so a duplicate's number can
+  never be reported as the payer of record. It is now a derived property over
+  the new `Visit.authoritative_efts` set.
+
+### Tests
+
+- `tests/test_employee_audit.py` (37 tests): Marcia filling and appending,
+  bottom placement, inherited styling, no double-add on re-run, the `Comment`
+  cross-check still applying; the catch-all off and on, always review-flagged
+  and never written unless accepted; audit headers on all three tabs at the
+  right header row with the right formatting, reused not duplicated, created
+  only on written tabs, stamped on filled/appended rows and blank elsewhere;
+  and the EFT being the paying remit's, never an `OA-18` duplicate's.
+- The synthetic roster gained a second `Whitfield, Harold` session (04/02) so
+  Marcia has a genuine append to make. Several tests that hardcoded row numbers
+  or counts now derive them, so the fixture can grow without churn.
+
+---
+
 ## [1.5.2] — 2026-09-10
 
 An `OA-18` exact-duplicate remittance could overwrite a real payment with
@@ -711,6 +787,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.6.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.6.0
 [1.5.2]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.2
 [1.5.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.1
 [1.5.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.0
