@@ -47,6 +47,11 @@ OXANA_TITLE = "Oxana - 2026 sessions"
 # `Thackeray, Renata` is Oxana's, with a blank Comment on the schedule.
 # `Whitfield, Harold` is Marcia's (fill-only tab).
 # `Delacroix, Owen` has a session that is not in the remit at all.
+#
+# The rows dated June 2026 pair with `RemitDoc-0000000004.PDF`
+# (`ASSOCIATES_CLAIMS` in `synthetic_remit_data.py`), which bills under three
+# different performing-provider NPIs so the NPI-gated append rule has
+# something to gate on.
 
 ANA_ROWS = [
     ("Castellano, Miguel", "03/26/2026", {}),
@@ -54,13 +59,26 @@ ANA_ROWS = [
     ("Castellano, Miguel", "04/09/2026", {"Paid by Ins toAna": 999.99}),
     ("Marlowe, Diane", "03/09/2026", {}),
     ("Delacroix, Owen", "01/05/2026", {}),
+    # Billed under Ana's own NPI, and also by the physician the same day, so
+    # the tab's NPI has to pick between the two matching EOB visits.
+    ("Ravensworth, Cecily", "06/02/2026", {}),
+    # In Oxana's tab too, and billed under OXANA's NPI -> Ana's row is flagged
+    # *practitioner mismatch*, never filled.
+    ("Beaumont, Sylvie", "06/10/2026", {}),
 ]
 
 MARCIA_ROWS = [
     ("Whitfield, Harold", "03/04/2026", {}),
+    # Billed incident-to under the supervising NPI: not a conflict, fills.
+    ("Whitfield, Harold", "06/05/2026", {}),
+    # Two physicians billed this date and Marcia has no NPI of her own to
+    # break the tie -> needs review.
+    ("Whitfield, Harold", "06/11/2026", {}),
 ]
 
 OXANA_ROWS = [
     ("Thackeray, Renata", "03/20/2026", {}),
     ("Thackeray, Renata", "04/07/2026", {}),
+    ("Nakamura, Hiroshi", "06/03/2026", {}),
+    ("Beaumont, Sylvie", "06/10/2026", {}),
 ]

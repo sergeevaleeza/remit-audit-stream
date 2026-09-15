@@ -34,8 +34,15 @@ needs the result to be auditable rather than fast.
 - **Optional DX reference.** Upload `List_of_Patients_Mutual.xlsx` and the app
   fills blank `DX` cells from it. Without it, `DX` is left blank as before.
 - **Optional employees workbook.** Upload `AMSMC_employees.xlsx` and the app
-  fills the Ana / Marcia / Oxana tabs from the reconciled schedule and hands
-  back a second download. Also optional — without it nothing changes.
+  fills the Ana / Marcia / Oxana tabs **directly from the reconciled EOBs** —
+  not from the updated schedule — and hands back a second download. Sessions
+  are only *added* to a tab when the EOB's performing-provider NPI says that
+  associate did the work; Marcia's tab is fill-only. Also optional — without it
+  nothing changes.
+- **Optional service-date cutoff.** Set *Ignore visits before* to drop visits
+  served earlier than a date from the whole run, so re-processing a remit that
+  covers already-archived sessions cannot re-add them. Empty by default, and
+  inclusive of the date itself.
 - **Telehealth is called out.** `Ins` is derived per visit from the remit's
   place of service: `POS 10(95)` for a telehealth encounter, `Medicare`
   otherwise.
@@ -123,8 +130,16 @@ an `[npi_to_doctor]` table in Streamlit secrets when deployed. See
 | `1000000001` | Dr. A |
 | `1000000002` | Dr. B |
 | `1000000003` | Dr. C |
+| `1000000011` | Ana |
+| `1000000012` | Oxana |
 
 An NPI outside this table leaves `Comment` blank and flags the visit for review.
+
+The last two are associates who bill under their own NPI rather than
+incident-to. That is a separate mapping from this one — see
+*[The tab → NPI mapping](#the-tab--npi-mapping)* — because it decides
+something different: not what to write in `Comment`, but which employee tab a
+session may be **added** to.
 
 ### DX reference (`List_of_Patients_Mutual.xlsx`)
 
@@ -187,52 +202,76 @@ the expected labels** rather than assumed, and labels are matched
 case-insensitively with internal whitespace collapsed (the real file contains
 `Co-payment   Old` and `Paid by Ins toAna`).
 
-**Mapped columns**, from the matched schedule visit:
+**The tabs are filled from the EOBs, not from the schedule.** Both outputs
+are independent consumers of the same reconciled visit set, taken *after*
+OA-18 / multi-EFT reconciliation — this path never reads a schedule cell. That
+matters because a schedule value can lag or be hand-edited: a visit the
+schedule records as `0.00` but the EOB actually paid puts the **paid** amount
+in the provider's tab.
 
-| Employee column | Schedule source |
+**Mapped columns**, from the matched EOB visit:
+
+| Employee column | EOB source |
 |---|---|
-| `Patient Name` / `Patient` | `Patient` |
-| `Date of Session` | `Data` |
-| `Insurance` | `Medicare` / `POS 10(95)` |
-| `Co-pay by EOB` | `Co-pay` |
-| provider payment column | `Payment` |
+| `Patient Name` / `Patient` | claim `NAME`, title-cased |
+| `Date of Session` | `SERV DATE` |
+| `Insurance` | `Medicare` / `POS 10(95)`, from POS + modifiers |
+| `Co-pay by EOB` | Σ `COINS` |
+| provider payment column | Σ `PROV-PD` |
+| `Remit Check/EFT #` | the **paying** remit's `CHECK/EFT #` |
 
 Everything else is left blank, and a non-blank cell is never overwritten.
 
 #### Which rows go where
 
-**The tabs are the source of truth for who belongs to whom** — staff curate
-them — so association is by **patient name + Date of Session**, never by the
-schedule's `Comment`.
+Filling and appending are decided by two different things, because they carry
+different risks. Filling a row the staff already created is safe — the tab
+roster says the session is theirs. *Adding* a row is a claim about who
+performed the work, and only the EOB can make it.
 
-1. **Fill** every existing tab row that matches a schedule visit on name
-   (suffix-aware) and parsed date.
-2. **Cross-check `Comment`, secondarily.** If the matched schedule row's
-   `Comment` names a *different provider tab*, the row is flagged
-   **practitioner mismatch — needs review** instead of filled. A blank
-   `Comment`, or one naming a physician (`Dr. …`) rather than a tab, is **not**
-   a conflict — it carries no signal about which tab is right.
-3. **Append** a patient's further sessions to the tab they already appear in.
-   **All three tabs behave the same way** — Ana, Marcia and Oxana each fill
-   their existing rows and append new sessions to the end of the tab. If a
-   patient appears in several tabs, `Comment` routes them; if it cannot, the
-   visit is flagged.
-4. **Unassigned.** A visit for a patient in no tab is listed as
-   *unassigned — needs manual placement*, never guessed at. Set
-   `FALLBACK_TO_COMMENT_FOR_NEW = True` to append such patients to the tab
-   their `Comment` names.
+1. **Fill — all three tabs.** Every existing tab row that matches a reconciled
+   EOB visit on patient name (suffix-aware) and parsed `Date of Session` is
+   filled from that visit.
+2. **Append — Ana and Oxana only, gated on the EOB's PERF PROV NPI.** A visit
+   is appended to the end of a tab only when it was billed under **that
+   associate's own NPI** and its (patient + `Date of Session`) is not already
+   in the tab. A patient being "known" to a tab is *not* enough: a session the
+   physician performed for one of Ana's patients is never added to Ana's tab.
+3. **Marcia — fill only, never append.** Her sessions are billed incident-to
+   under the supervising physician's NPI, so no EOB can prove one is hers. Her
+   tab roster defines ownership; a Marcia visit with no row waiting for it is
+   listed, not placed.
+4. **Practitioner cross-check.** When filling an Ana or Oxana row, if the
+   matched EOB visit was billed under the *other associate's* NPI the row is
+   flagged **practitioner mismatch — needs review** rather than filled. A
+   supervising-physician NPI is **not** a conflict — it is the ordinary way an
+   associate's session is billed and says nothing about who performed it.
+5. **Ambiguity.** If several reconciled EOB visits match one patient + date
+   (two providers billed that day), the tab's own NPI picks between them. On
+   Marcia's tab, or when the tie survives, the row is flagged
+   **ambiguous EOB match — needs review** and nothing is written.
+6. **Unassigned.** Anything that neither filled a row nor appended is listed as
+   *unassigned — needs manual placement*, never guessed at, with the EOB's NPI
+   shown so the reason is visible. **Most visits bill under the supervising
+   physician's NPI, so this list is normally long** — it is the physician's own
+   direct patients plus every Marcia session without a row.
 
-#### Optional catch-all (`MARCIA_CATCH_ALL_UNASSIGNED`, default `False`)
+#### The tab → NPI mapping
 
-With this on, a visit whose patient is in **no** provider tab is appended to
-the end of Marcia's tab instead of being listed as unassigned, flagged
-*Append (auto-placed, unassigned) — review* and never accepted by default.
+Appends need to know each associate's own NPI. Like the provider mapping, the
+real values are **never committed**: the app ships a synthetic placeholder
+(`remit/config.py`). To use real values, copy `employee_npi.example.json` to
+`employee_npi.local.json` (repo root, gitignored), or set an `[employee_npi]`
+table in Streamlit secrets when deployed.
 
-> **Warning.** Most visits bill under the supervising physician's NPI
-> (incident-to), so a large share of "no tab" patients are that physician's
-> **own direct patients**, who legitimately belong in no associate's tab.
-> Turning this on sweeps every one of them into Marcia's tab, making it an
-> overflow bucket. Leave it `False` unless that is explicitly wanted.
+| Tab | NPI | Appends? |
+|---|---|---|
+| Ana | her own PERF PROV NPI | yes, for visits carrying it |
+| Oxana | her own PERF PROV NPI | yes, for visits carrying it |
+| Marcia | *(none — bills incident-to)* | **no, fill-only** |
+
+A tab omitted from the mapping is fill-only, which is the safe default: the
+app can only ever *fail to add* a row, never add someone else's.
 
 #### Audit columns on each tab
 
@@ -249,6 +288,22 @@ other row is left untouched. The headers are created only on tabs the run
 actually writes to, and are reused rather than duplicated on later runs.
 
 Dedup is by patient + Date of Session, so re-running adds nothing.
+
+### Service-date cutoff
+
+An optional **Ignore visits before (service date)** input, **empty by
+default**. When set, every remittance visit served *before* that date is
+dropped from the run; a visit dated exactly **on** the cutoff is kept.
+
+The drop happens once, on the reconciled visit set, **before either the
+schedule or the employees file sees it** — so the two outputs can never
+disagree about what was in scope. Its purpose is re-processing: providers
+archive older sessions and reconcile them by hand, and re-uploading a remit
+that covers them would otherwise re-append rows they have already finished
+with. Leaving it empty processes everything, exactly as before; data is never
+dropped unless you ask for it.
+
+The active cutoff is shown in the preview and in the employees section.
 
 ### Where new rows go
 
@@ -338,21 +393,30 @@ specific invited viewers) can open it, rather than leaving it public.
 2. Upload one or more remittance PDFs.
 3. Optionally upload `List_of_Patients_Mutual.xlsx` to source the `DX` column.
 4. Optionally upload `AMSMC_employees.xlsx` to fill the provider tabs.
-5. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
+5. Optionally set **Ignore visits before (service date)**. Leave it empty to
+   process everything. When set, visits served before that date are dropped
+   from the whole run — schedule *and* employees file — so re-uploading a remit
+   covering sessions the providers have already archived cannot re-add them. A
+   visit dated on the cutoff itself is kept, and the active cutoff is shown in
+   the preview.
+6. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
    (already paid) · W need review*.
-6. Work through the preview table. Untick anything you do not want applied.
+7. Work through the preview table. Untick anything you do not want applied.
    Items flagged **Needs review** start unticked. The **DX (from Mutual)**
    column shows what would go into a blank `DX` cell, and **Processed On** /
    **Remit Check/EFT #** show the audit stamps.
-7. Review the per-provider **Employees file** section: what each tab would be
-   filled with or have appended, plus anything flagged *practitioner mismatch*
-   or *unassigned*.
-8. Click **Confirm & generate file**, then **Download updated schedule** — and,
+8. Review the per-provider **Employees file** section. Every value there comes
+   **directly from the EOB**, not from the updated schedule. Each row shows its
+   action — *fill*, *append (NPI-matched)*, *practitioner mismatch*,
+   *ambiguous* or *unassigned* — alongside the EOB's NPI, which is what decides
+   whether a session may be appended. Ana and Oxana take appends for visits
+   billed under their own NPI; **Marcia is fill-only**.
+9. Click **Confirm & generate file**, then **Download updated schedule** — and,
    if you uploaded it, **Download updated employees file**. They are named
    `List_of_Patients_Schedule_updated_YYYY-MM-DD.xlsx` and
    `AMSMC_employees_updated_YYYY-MM-DD.xlsx` so successive archived copies do
    not collide.
-9. Use **Clear all data** when you are done to wipe the session.
+10. Use **Clear all data** when you are done to wipe the session.
 
 ---
 
@@ -516,6 +580,18 @@ BAA-covered**, so processing real PHI there is itself a gap — see
   matches the suffix row correctly but only *flags* the leftover duplicate in
   the preview — removing it is a manual decision.
 - **Unknown NPIs** leave `Comment` blank and are flagged rather than guessed.
+- **An associate who bills incident-to gets no employee-tab appends.** Adding a
+  row to a provider's tab is a claim about who performed the session, and only
+  the EOB's PERF PROV NPI can support one. A practitioner whose sessions bill
+  under the supervising physician's NPI is therefore fill-only: her existing
+  rows are filled, and her other sessions are listed for manual placement. This
+  is deliberate — the alternative is guessing from the tab roster, which
+  attributes the physician's own patients to whichever associate happens to
+  share them.
+- **The service-date cutoff is a blunt filter.** It drops visits by service
+  date alone, for the whole run. It does not know which ones were already
+  reconciled, so a cutoff set too late silently skips work that still needed
+  doing. It is empty by default for that reason.
 - **Workbook repair.** Excel writes `<family val="18">`/`"34"` font attributes
   that openpyxl's schema rejects (it caps the value at 14). The real schedule
   hits this. The app clamps that one attribute in an in-memory copy of the zip

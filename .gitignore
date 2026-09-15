@@ -27,6 +27,10 @@ myenv/
 # The real clinic's provider mapping. Ship only npi_map.example.json.
 npi_map.local.json
 
+# The real clinic's tab -> associate NPI mapping, used to gate employee-tab
+# appends. Ship only employee_npi.example.json.
+employee_npi.local.json
+
 # Local-only PHI denylist for scripts/check_for_phi.py (real surnames etc).
 phi_denylist.local.txt
 

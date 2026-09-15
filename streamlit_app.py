@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 from collections import Counter
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +18,7 @@ import streamlit as st
 from remit.config import (
     ACTION_FILL,
     EMPLOYEE_APPEND_SHEETS,
+    EMPLOYEE_NPI,
     EMPLOYEE_SHEETS,
     ACTION_NEW,
     ACTION_REVIEW,
@@ -39,15 +41,21 @@ from remit.excel_updater import (
     read_schedule_rows,
     resolve_columns,
 )
-from remit.matching import build_plan, find_legacy_duplicate_rows, summarize
+from remit.matching import (
+    apply_service_date_cutoff,
+    build_plan,
+    cutoff_label,
+    find_legacy_duplicate_rows,
+    summarize,
+)
 from remit.employees import (
     EmployeesError,
     build_updated_employees,
     employees_download_filename,
+    eob_visits,
     load_employees_workbook,
     plan_employee_changes,
     read_sheets,
-    schedule_visits_from_plan,
     summarize_employees,
 )
 from remit.mutual import load_dx_lookup
@@ -76,8 +84,13 @@ def clear_session() -> None:
 
 def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]],
                      mutual_bytes: bytes | None,
-                     employees_bytes: bytes | None = None) -> str:
-    """Stable id for one set of uploads, so parsing only reruns when they change."""
+                     employees_bytes: bytes | None = None,
+                     cutoff: date | None = None) -> str:
+    """Stable id for one run, so parsing only reruns when something changes.
+
+    The cutoff is part of it: changing the date changes which visits the run
+    sees, so the plan has to be rebuilt even though the uploads are the same.
+    """
     digest = hashlib.sha256(schedule_bytes)
     for payload, name in pdf_payloads:
         digest.update(name.encode("utf-8"))
@@ -88,6 +101,7 @@ def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]
     if employees_bytes:
         digest.update(b"employees")
         digest.update(employees_bytes)
+    digest.update(b"cutoff:" + (cutoff.isoformat() if cutoff else "none").encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -176,25 +190,38 @@ def render_legacy_duplicates(rows) -> None:
             )
 
 
-def render_employee_preview(changes) -> None:
-    """Per-provider table of what the employees workbook would receive."""
+def render_employee_preview(changes, cutoff: date | None = None) -> None:
+    """Per-provider table of what the employees workbook would receive.
+
+    Every value shown comes from the reconciled EOB visit, not from the
+    schedule, so this section is readable without cross-referencing the other
+    download.
+    """
     if not changes:
         return
 
     counts = summarize_employees(changes)
     st.subheader("Employees file (AMSMC_employees.xlsx)")
+    st.caption(
+        "Filled directly from the reconciled EOB visits — not from the updated "
+        f"schedule. {cutoff_label(cutoff)}."
+    )
     st.markdown(
-        f"**{counts['fill']}** row(s) to fill · **{counts['append']}** to append · "
-        f"**{counts['mismatch']}** practitioner mismatch · "
+        f"**{counts['fill']}** row(s) to fill · **{counts['append']}** to append "
+        f"(NPI-matched) · **{counts['mismatch']}** practitioner mismatch · "
+        f"**{counts['ambiguous']}** ambiguous · "
         f"**{counts['unassigned']}** unassigned · "
-        f"**{counts['no_match']}** with no Schedule match"
+        f"**{counts['no_match']}** with no EOB match"
     )
 
     for sheet in EMPLOYEE_SHEETS:
         rows = [c for c in changes if c.sheet == sheet]
         if not rows:
             continue
-        note = "" if sheet in EMPLOYEE_APPEND_SHEETS else " — fill-only"
+        if sheet in EMPLOYEE_APPEND_SHEETS:
+            note = f" — fills, and appends visits billed under NPI {EMPLOYEE_NPI[sheet]}"
+        else:
+            note = " — fill-only (sessions bill under the supervising NPI)"
         with st.expander(f"{sheet}{note} ({len(rows)} row(s))", expanded=False):
             st.dataframe(
                 pd.DataFrame([
@@ -202,6 +229,7 @@ def render_employee_preview(changes) -> None:
                         "Action": c.action,
                         "Patient": c.patient,
                         "Date of Session": c.session_date,
+                        "EOB NPI": c.npi or "—",
                         "Insurance": c.insurance or "—",
                         "Co-pay by EOB": c.copay if c.copay is not None else "—",
                         "Payment": c.payment if c.payment is not None else "—",
@@ -219,14 +247,17 @@ def render_employee_preview(changes) -> None:
     unplaced = [c for c in changes if not c.sheet]
     if unplaced:
         st.warning(
-            f"{len(unplaced)} visit(s) are for patients who appear in no provider "
-            "tab. They are listed rather than guessed at — place them by hand."
+            f"{len(unplaced)} visit(s) belong to no tab: either the patient is in "
+            "no provider tab, or the EOB's NPI is not that tab's provider — most "
+            "visits bill under the supervising physician's NPI, so this is normal. "
+            "They are listed rather than guessed at."
         )
         with st.expander("Unassigned visits", expanded=False):
             st.dataframe(
                 pd.DataFrame([
                     {"Patient": c.patient, "Date of Session": c.session_date,
-                     "Insurance": c.insurance, "Payment": c.payment}
+                     "EOB NPI": c.npi, "Insurance": c.insurance,
+                     "Payment": c.payment, "Why": c.note}
                     for c in unplaced
                 ]),
                 hide_index=True, use_container_width=True,
@@ -273,8 +304,9 @@ with st.sidebar:
 1. Upload `List_of_Patients_Schedule.xlsx`
 2. Upload one or more remittance PDFs
 3. Optionally upload `List_of_Patients_Mutual.xlsx` for DX codes
-4. Review every proposed change
-5. Confirm and download the updated copy
+4. Optionally set **Ignore visits before** to skip archived service dates
+5. Review every proposed change
+6. Confirm and download the updated copy
 
 Only the **{SHEET_NAME}** sheet is touched. Blank cells are the only cells
 ever written — with one exception you always confirm first: an
@@ -331,9 +363,25 @@ with right:
 with far_right:
     employees_upload = st.file_uploader(
         "4 · Employees file (optional)", type=["xlsx"], accept_multiple_files=False,
-        help="AMSMC_employees.xlsx — the Ana / Marcia / Oxana tabs. Filled from "
-             "the schedule and offered as a second download.",
+        help="AMSMC_employees.xlsx — the Ana / Marcia / Oxana tabs. Filled "
+             "directly from the reconciled EOB data and offered as a second "
+             "download. Sessions are only added to a tab when the EOB's "
+             "performing-provider NPI says that associate did the work.",
     )
+
+cutoff = st.date_input(
+    "Ignore visits before (service date)",
+    value=None,
+    format="MM/DD/YYYY",
+    help="Optional. Drops every remittance visit served BEFORE this date, for "
+         "both the schedule and the employees file. Inclusive — a visit on the "
+         "date itself is kept. Leave empty to process everything.",
+)
+st.caption(
+    f"Service-date filter: **{cutoff_label(cutoff)}**. Use it to skip periods the "
+    "providers have already archived and reconciled by hand, so re-uploading an "
+    "old remit cannot re-append rows they have finished with."
+)
 
 if not schedule_upload or not pdf_uploads:
     st.info("Upload the schedule workbook and at least one remittance PDF to begin.")
@@ -343,7 +391,9 @@ schedule_bytes = schedule_upload.getvalue()
 pdf_payloads = [(upload.getvalue(), upload.name) for upload in pdf_uploads]
 mutual_bytes = mutual_upload.getvalue() if mutual_upload else None
 employees_bytes = employees_upload.getvalue() if employees_upload else None
-signature = upload_signature(schedule_bytes, pdf_payloads, mutual_bytes, employees_bytes)
+signature = upload_signature(
+    schedule_bytes, pdf_payloads, mutual_bytes, employees_bytes, cutoff
+)
 
 
 # --- Parse (only when the uploads change) ----------------------------------
@@ -363,12 +413,18 @@ if st.session_state.get("signature") != signature:
 
     with st.spinner("Parsing remittance PDFs…"):
         try:
-            documents, visits = parse_remittances(
+            documents, parsed_visits = parse_remittances(
                 [(io.BytesIO(payload), name) for payload, name in pdf_payloads]
             )
         except Exception as error:  # noqa: BLE001
             safe_error("Could not parse the PDFs", error)
             st.stop()
+
+    # One cutoff, applied to the reconciled visit set before either consumer
+    # sees it, so the schedule and the employees file can never disagree about
+    # which visits are in scope.
+    visits = apply_service_date_cutoff(parsed_visits, cutoff)
+    dropped = len(parsed_visits) - len(visits)
 
     dx_lookup = None
     if mutual_bytes:
@@ -393,8 +449,10 @@ if st.session_state.get("signature") != signature:
         try:
             employees_workbook = load_employees_workbook(employees_bytes)
             employee_sheets = read_sheets(employees_workbook)
+            # The same reconciled visits the schedule plan was built from --
+            # the employees file never reads a schedule cell.
             employee_changes = plan_employee_changes(
-                employee_sheets, schedule_visits_from_plan(rows, plan)
+                employee_sheets, eob_visits(visits)
             )
         except EmployeesError as error:
             st.error(str(error))
@@ -408,6 +466,7 @@ if st.session_state.get("signature") != signature:
         documents=documents,
         plan=plan,
         employee_changes=employee_changes,
+        dropped_by_cutoff=dropped,
         schedule_row_count=len(rows),
         schedule_rows=rows,
         dx_entry_count=len(dx_lookup) if dx_lookup else 0,
@@ -428,6 +487,14 @@ st.success(
     + (f" DX reference loaded: {dx_entry_count} patient(s)." if dx_entry_count
        else " No DX reference uploaded — DX will be left blank.")
 )
+
+dropped_by_cutoff = st.session_state.get("dropped_by_cutoff", 0)
+if dropped_by_cutoff:
+    st.info(
+        f"Service-date cutoff **{cutoff.strftime('%m/%d/%Y')}** — "
+        f"{dropped_by_cutoff} parsed visit(s) served before it were dropped from "
+        "this run, for both the schedule and the employees file."
+    )
 
 dx_conflicts = st.session_state.get("dx_conflicts") or {}
 if dx_conflicts:
@@ -468,7 +535,7 @@ st.header("Preview proposed changes")
 render_summary(summarize(plan))
 render_review_items(plan)
 render_telehealth_flags(plan)
-render_employee_preview(employee_changes)
+render_employee_preview(employee_changes, cutoff)
 render_legacy_duplicates(st.session_state.get("schedule_rows") or [])
 
 actionable = [c for c in plan if c.action != ACTION_SKIP]

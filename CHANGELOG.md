@@ -3,6 +3,152 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] — 2026-09-15
+
+The employees workbook is now populated **directly from the reconciled EOB
+visits** instead of by reading values back out of the updated schedule, and
+appending a session to a provider tab is gated on the EOB's performing-provider
+NPI. Adds an optional service-date cutoff for the whole run. 427 tests pass
+(was 381). The Mutual workbook remains a read-only DX source and is never
+modified.
+
+### Changed — the employees file is sourced from the EOBs, not the schedule
+
+The schedule and the employees workbook are now two **independent consumers**
+of one reconciled visit set, taken *after* OA-18 / multi-EFT reconciliation.
+The employees path no longer reads a schedule cell at all, and the
+schedule→employees dependency is gone.
+
+This is a behaviour change, not just a refactor. A schedule value can lag the
+remit or be hand-edited, and per never-overwrite the app leaves it alone — so
+the old path copied that stale value into the provider's tab. The clearest
+case is a visit recorded as `0.00` that a later EOB actually paid: the tab used
+to receive `0.00`, and now receives the paid amount.
+
+- `ScheduleVisit` / `schedule_visits_from_plan()` are replaced by `EobVisit` /
+  `eob_visits()`, built straight from `pdf_parser.Visit`.
+- Every mapped column — `Insurance`, `Co-pay by EOB`, the per-provider payment
+  column, `Processed On`, `Remit Check/EFT #` — comes from the EOB visit.
+  Patient names are title-cased to the tabs' style, as before.
+- `EobVisit` is frozen, so nothing downstream can edit a visit in place.
+- A visit seen **only** as an OA-18 duplicate carries a review note and is
+  never auto-accepted: no remit actually paid it, and writing its `$0.00` into
+  a provider's pay sheet would be wrong.
+
+### Changed — Ana/Oxana appends are gated on the EOB NPI
+
+Appending a row to a provider tab is a claim about who performed a session, so
+it is now made only by the EOB. A visit is appended to Ana's or Oxana's tab
+only when its **PERF PROV NPI is that associate's own** and its (patient +
+`Date of Session`) is not already in the tab.
+
+Tab-roster identity no longer drives appends. A patient being "known" to a tab
+is not enough — previously a session the supervising physician performed for
+one of Ana's patients was appended to Ana's tab purely because she already had
+the patient.
+
+Filling is unchanged in spirit and still applies to **all three tabs**: an
+existing row is matched by patient name (suffix-aware) + `Date of Session` and
+filled from the matching EOB visit.
+
+### Changed — Marcia is fill-only again
+
+Reverses 1.6.0's "Marcia appends like the other tabs". Her sessions are billed
+incident-to under the supervising physician's NPI, so no EOB can prove a visit
+is hers; her tab roster is what defines ownership. Existing Marcia rows are
+filled; a Marcia visit with no row waiting for it is **listed, not placed**.
+
+`EMPLOYEE_APPEND_SHEETS` is now derived — exactly the tabs that have an NPI of
+their own — rather than hand-maintained, so the two can never disagree.
+
+### Removed — the Marcia catch-all and the `Comment` cross-check
+
+- **`MARCIA_CATCH_ALL_UNASSIGNED`** and `EMPLOYEE_CATCH_ALL_SHEET` are gone
+  along with the roster-based append, as is the
+  `Append (auto-placed, unassigned)` action. The hazard they carried is now
+  structural rather than opt-in: a tab with no NPI simply cannot receive rows.
+- **`FALLBACK_TO_COMMENT_FOR_NEW`** is gone. It routed by the schedule's
+  `Comment`, which this path no longer reads.
+- The `Comment`-based practitioner cross-check is replaced by an **NPI** one.
+
+### Added — practitioner cross-check and ambiguity, both by NPI
+
+- **Practitioner mismatch.** Filling an Ana or Oxana row whose matched EOB
+  visit was billed under the *other associate's* NPI flags
+  *practitioner mismatch — needs review* instead of filling. A
+  **supervising-physician NPI is not a conflict** — it is the ordinary way an
+  associate's session is billed and says nothing about who performed it.
+  Marcia's tab is exempt entirely, since her roster decides.
+- **Ambiguous EOB match.** When several reconciled visits match one patient +
+  date (two providers billed that day), the tab's own NPI picks between them.
+  On Marcia's tab, or when the tie survives, the row is flagged
+  *ambiguous EOB match — needs review* and nothing is written.
+- Unassigned visits now show the EOB's NPI and say *why* no tab claimed them.
+  Most visits bill under the supervising physician's NPI, so this list is
+  normally long — that is expected, not a failure.
+
+### Added — the tab → NPI mapping (`employee_npi.local.json`)
+
+Which NPI belongs to which associate is a real clinic identifier, so it follows
+the same rule as `NPI_TO_DOCTOR`: **never committed**. The app ships a
+synthetic placeholder in `remit/config.py`; real values go in
+`employee_npi.local.json` (repo root, gitignored — see the new
+`employee_npi.example.json`) or an `[employee_npi]` table in Streamlit secrets.
+
+A tab omitted from the mapping is fill-only. That is the safe default: the app
+can then only ever fail to add a row, never add somebody else's.
+
+### Added — optional service-date cutoff
+
+A new **Ignore visits before (service date)** input, **empty by default**.
+
+- When set, every reconciled visit served **before** the date is dropped.
+  **Inclusive**: a visit dated exactly on the cutoff is kept.
+- **Scope is the whole run** — the drop happens on the reconciled visit set
+  *before* either the schedule or the employees file sees it, so the two
+  outputs can never disagree about what was in scope.
+- Empty means no cutoff and everything is processed. Data is never dropped
+  unless the user asks for it.
+- The active cutoff appears in the page and in the employees preview
+  (*cutoff: on/after 07/01/2026*), and is part of the upload signature, so
+  changing it re-plans rather than reusing a cached plan.
+
+Its purpose is re-processing: providers archive older sessions and reconcile
+them by hand, and re-uploading a remit covering them would otherwise re-append
+rows they have finished with.
+
+### Added — preview
+
+- Each provider tab's table gains an **EOB NPI** column, so the reason a
+  session was or was not appended is visible without opening the remit.
+- Tab headings say what each tab does — *"fills, and appends visits billed
+  under NPI …"* versus *"fill-only (sessions bill under the supervising
+  NPI)"*.
+- The employees section states outright that it is filled from the EOB data,
+  and shows the active cutoff.
+
+### Added — tests and fixtures
+
+- `tests/test_employees_from_eob.py` (43 tests): the EOB is the source and a
+  differing schedule value cannot reach the tabs; NPI-gated appends including
+  the negative cases; Marcia never appends; the cutoff in both directions and
+  on both consumers; OA-18 duplicates still not zeroing employee values;
+  idempotent re-runs.
+- `tests/fixtures/RemitDoc-0000000004.PDF` and `make_associates_fixture.py`:
+  a fourth synthetic remittance carrying **three different performing-provider
+  NPIs**. The existing fixtures each bill under a single NPI, which cannot
+  exercise the gate at all. Its June 2026 dates pair with new rows in the
+  synthetic employees workbook.
+- App-level coverage that the cutoff input defaults to empty and that setting
+  it is reflected in the page.
+
+### Internal
+
+- `remit/config.py`'s local-file and Streamlit-secrets loaders are generalised
+  (`_load_local_map`, `_load_secrets_map`) and shared by both mappings.
+- `apply_service_date_cutoff()` and `cutoff_label()` live in `remit/matching.py`
+  and operate on the reconciled visit list.
+
 ## [1.6.0] — 2026-09-10
 
 Marcia's tab now appends as well as fills, and every provider tab gains
@@ -787,6 +933,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.7.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.7.0
 [1.6.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.6.0
 [1.5.2]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.2
 [1.5.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.1

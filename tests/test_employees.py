@@ -5,13 +5,16 @@ employees workbook reproduces the real file's awkward parts: Oxana's header sits
 on row 2 while Ana's and Marcia's sit on row 1, her patient column is headed
 `Patient` rather than `Patient Name`, and several labels carry doubled internal
 spaces.
+
+The tabs are populated from the reconciled EOB visits, never from the schedule
+-- see `test_employees_from_eob.py` for the rules that decide which tab gets
+what.
 """
 
 from __future__ import annotations
 
 import io
 from datetime import date
-from pathlib import Path
 
 import openpyxl
 import pytest
@@ -26,19 +29,16 @@ from remit.config import (
     TELEHEALTH_INSURANCE_LABEL,
 )
 from remit.employees import (
-    EmployeeChange,
     EmployeesError,
-    ScheduleVisit,
     build_updated_employees,
     column_for,
     employees_download_filename,
+    eob_visits,
     find_header_row,
     header_key,
     load_employees_workbook,
-    names_a_provider_tab,
     plan_employee_changes,
     read_sheets,
-    schedule_visits_from_plan,
     summarize_employees,
 )
 from remit.excel_updater import (
@@ -52,31 +52,17 @@ from remit.pdf_parser import insurance_label, parse_service_line
 
 from .conftest import find_visit
 
-EMPLOYEES_XLSX = Path(__file__).parent / "fixtures" / "AMSMC_employees_sample.xlsx"
 STAMP = date(2026, 9, 10)
 
 
 @pytest.fixture()
-def employees_bytes() -> bytes:
-    return EMPLOYEES_XLSX.read_bytes()
+def sheets(employee_sheets):
+    return employee_sheets
 
 
 @pytest.fixture()
-def sheets(employees_bytes):
-    return read_sheets(load_employees_workbook(employees_bytes))
-
-
-@pytest.fixture()
-def schedule_plan(schedule_bytes, visits):
-    worksheet = get_schedule_sheet(load_schedule_workbook(schedule_bytes))
-    rows = read_schedule_rows(worksheet, resolve_columns(worksheet))
-    return rows, build_plan(visits, rows, today=STAMP)
-
-
-@pytest.fixture()
-def emp_changes(sheets, schedule_plan):
-    rows, plan = schedule_plan
-    return plan_employee_changes(sheets, schedule_visits_from_plan(rows, plan))
+def emp_changes(sheets, all_visits):
+    return plan_employee_changes(sheets, eob_visits(all_visits), today=STAMP)
 
 
 def change_for(changes, patient, session_date, sheet=None):
@@ -155,7 +141,7 @@ def test_pos_10_without_the_modifier_is_not_telehealth():
     assert not line.telehealth
 
 
-def test_new_schedule_row_takes_ins_from_the_visit(visits, schedule_plan):
+def test_new_schedule_row_takes_ins_from_the_visit(visits):
     """A telehealth visit appended to the schedule says `POS 10(95)`."""
     from remit.matching import new_row_values
 
@@ -163,14 +149,23 @@ def test_new_schedule_row_takes_ins_from_the_visit(visits, schedule_plan):
     assert new_row_values(visit)["Ins"] == "POS 10(95)"
 
 
-def test_existing_medicare_row_is_flagged_not_overwritten(schedule_plan):
+def test_existing_medicare_row_is_flagged_not_overwritten(schedule_bytes, visits):
     """Never-overwrite still holds: the row is flagged, `Ins` left alone."""
-    _, plan = schedule_plan
+    worksheet = get_schedule_sheet(load_schedule_workbook(schedule_bytes))
+    rows = read_schedule_rows(worksheet, resolve_columns(worksheet))
+    plan = build_plan(visits, rows, today=STAMP)
+
     flagged = [c for c in plan if c.telehealth_mismatch]
     assert flagged
     for change in flagged:
         assert "left as-is" in change.telehealth_mismatch
         assert change.ins_update == ""
+
+
+def test_telehealth_label_reaches_the_employees_visit(all_visits):
+    petrossian = next(v for v in eob_visits(all_visits)
+                      if v.patient.startswith("Petrossian"))
+    assert petrossian.insurance == "POS 10(95)"
 
 
 # --- Reading the workbook ---------------------------------------------------
@@ -223,6 +218,13 @@ def test_sheet_without_a_header_row_is_rejected():
         find_header_row(sheet)
 
 
+def test_has_session_is_the_append_dedup_key(sheets):
+    ana = sheets["Ana"]
+    assert ana.has_session("Castellano, Miguel", date(2026, 3, 26))
+    assert not ana.has_session("Castellano, Miguel", date(2026, 4, 21))
+    assert not ana.has_session("Nobody, Atall", date(2026, 3, 26))
+
+
 # --- Routing by name + date -------------------------------------------------
 
 def test_existing_row_is_filled_by_name_and_date(emp_changes):
@@ -232,51 +234,50 @@ def test_existing_row_is_filled_by_name_and_date(emp_changes):
     assert change.payment_column == "Paid by Ins toAna"
 
 
-def test_routing_ignores_a_physician_comment(emp_changes):
-    """`Comment` of `Dr. A` names no tab, so it never blocks a fill."""
+def test_a_supervising_npi_never_blocks_a_fill(emp_changes):
+    """Marcia's sessions bill incident-to, which is not a conflict."""
     change = change_for(emp_changes, "Whitfield", "03/04/2026", sheet="Marcia")
     assert change.action == EMP_ACTION_FILL
 
 
-def test_blank_comment_fills_normally(emp_changes):
+def test_oxana_row_fills_normally(emp_changes):
     change = change_for(emp_changes, "Thackeray", "04/07/2026", sheet="Oxana")
     assert change.action == EMP_ACTION_FILL
 
 
-def test_comment_naming_another_tab_is_a_mismatch(emp_changes):
-    """Marlowe sits in Ana's tab but her Schedule Comment says `Oxana`."""
-    change = change_for(emp_changes, "Marlowe", "03/09/2026", sheet="Ana")
+def test_another_associates_npi_is_a_mismatch(emp_changes):
+    """`Beaumont` sits in Ana's tab but Oxana's NPI performed the session."""
+    change = change_for(emp_changes, "Beaumont", "06/10/2026", sheet="Ana")
     assert change.action == EMP_ACTION_MISMATCH
     assert not change.accepted
     assert "Oxana" in change.note
 
 
-def test_a_physician_comment_is_not_a_provider_tab():
-    assert names_a_provider_tab("Dr. A") is None
-    assert names_a_provider_tab("") is None
-    assert names_a_provider_tab("Oxana") == "Oxana"
-    assert names_a_provider_tab("  ana ") == "Ana"
+def test_suffix_aware_matching_still_applies(sheets, all_visits):
+    """`BYSTRITSKAYA, ANNA` must match a `Bystritskaya Jr, Anna` tab row."""
+    from remit.employees import _matches_for
+
+    matches = _matches_for(eob_visits(all_visits), "Bystritskaya Jr, Anna",
+                           date(2026, 4, 14))
+    assert len(matches) == 1
 
 
 # --- Append behaviour -------------------------------------------------------
 
 def test_new_session_appends_for_ana(emp_changes):
-    change = change_for(emp_changes, "Castellano", "04/21/2026", sheet="Ana")
+    """Only because 06/16 was billed under Ana's own NPI."""
+    change = change_for(emp_changes, "Ravensworth", "06/16/2026", sheet="Ana")
     assert change.action == EMP_ACTION_APPEND
 
 
 def test_new_session_appends_for_oxana(emp_changes):
-    change = change_for(emp_changes, "Thackeray", "04/24/2026", sheet="Oxana")
+    change = change_for(emp_changes, "Nakamura", "06/17/2026", sheet="Oxana")
     assert change.action == EMP_ACTION_APPEND
 
 
-def test_marcia_appends_like_the_other_tabs(emp_changes):
-    """Marcia used to be fill-only; she now appends for her own patients."""
-    appends = [c for c in emp_changes
-               if c.sheet == "Marcia" and c.action == EMP_ACTION_APPEND]
-    assert len(appends) == 1
-    assert appends[0].patient.startswith("Whitfield")
-    assert appends[0].session_date == "04/02/2026"
+def test_marcia_never_appends(emp_changes):
+    """Her tab roster defines ownership; the remit cannot add to it."""
+    assert not [c for c in emp_changes if c.sheet == "Marcia" and c.appends]
 
 
 def test_patient_in_no_tab_is_unassigned(emp_changes):
@@ -286,11 +287,10 @@ def test_patient_in_no_tab_is_unassigned(emp_changes):
     assert not change.accepted
 
 
-def test_unassigned_is_not_routed_by_comment(emp_changes):
-    """FALLBACK_TO_COMMENT_FOR_NEW is False, so nothing is guessed."""
+def test_unassigned_visits_are_never_placed_by_guesswork(emp_changes):
     unassigned = [c for c in emp_changes if c.action == EMP_ACTION_UNASSIGNED]
     assert unassigned
-    assert all(c.sheet in ("", "Marcia") for c in unassigned)
+    assert all(c.sheet == "" and not c.fills and not c.accepted for c in unassigned)
 
 
 # --- Writing ----------------------------------------------------------------
@@ -320,10 +320,10 @@ def test_oxana_mapping_uses_paid_by_insurance(employees_bytes, emp_changes):
 def test_appended_row_carries_the_mapped_columns(employees_bytes, emp_changes):
     updated, _ = build_updated_employees(employees_bytes, emp_changes)
     workbook = load_employees_workbook(updated.getvalue())
-    row = sheet_values(workbook["Ana"], 1)[("Castellano, Miguel", "05/07/2026")]
+    row = sheet_values(workbook["Ana"], 1)[("Ravensworth, Cecily", "06/16/2026")]
     assert row["Insurance"] == "Medicare"
-    assert row["Co-pay by EOB"] == 57.29
-    assert row["Paid by Ins toAna"] == 224.59
+    assert row["Co-pay by EOB"] == 47.53
+    assert row["Paid by Ins toAna"] == 186.31
     # Unmapped columns stay blank.
     assert row["Memo"] is None
     assert row["Billed"] is None
@@ -340,7 +340,7 @@ def test_never_overwrites_a_populated_cell(employees_bytes, emp_changes):
 def test_mismatched_row_is_not_filled(employees_bytes, emp_changes):
     updated, _ = build_updated_employees(employees_bytes, emp_changes)
     workbook = load_employees_workbook(updated.getvalue())
-    row = sheet_values(workbook["Ana"], 1)[("Marlowe, Diane", "03/09/2026")]
+    row = sheet_values(workbook["Ana"], 1)[("Beaumont, Sylvie", "06/10/2026")]
     assert row["Paid by Ins toAna"] is None
     assert row["Insurance"] is None
 
@@ -348,7 +348,9 @@ def test_mismatched_row_is_not_filled(employees_bytes, emp_changes):
 def test_appended_rows_inherit_styling(employees_bytes, emp_changes):
     updated, _ = build_updated_employees(employees_bytes, emp_changes)
     worksheet = load_employees_workbook(updated.getvalue())["Ana"]
-    template, appended = 5, 6  # last original row, first appended row
+    # Ana's tab has six seeded rows (2-7); the append lands on row 8.
+    template, appended = 7, 8
+    assert worksheet.cell(row=appended, column=1).value == "Ravensworth, Cecily"
     for column in (1, 2, 8):
         assert (worksheet.cell(row=appended, column=column).number_format
                 == worksheet.cell(row=template, column=column).number_format)
@@ -356,15 +358,14 @@ def test_appended_rows_inherit_styling(employees_bytes, emp_changes):
                 == worksheet.cell(row=template, column=column).font.name)
 
 
-def test_rerun_appends_nothing_new(employees_bytes, sheets, schedule_plan):
+def test_rerun_appends_nothing_new(employees_bytes, sheets, all_visits):
     """Dedup by patient + Date of Session: no double-adds."""
-    rows, plan = schedule_plan
-    visits = schedule_visits_from_plan(rows, plan)
-    first = plan_employee_changes(sheets, visits)
+    visits = eob_visits(all_visits)
+    first = plan_employee_changes(sheets, visits, today=STAMP)
     once, _ = build_updated_employees(employees_bytes, first)
 
     reread = read_sheets(load_employees_workbook(once.getvalue()))
-    second = plan_employee_changes(reread, visits)
+    second = plan_employee_changes(reread, visits, today=STAMP)
     _, stats = build_updated_employees(once.getvalue(), second)
 
     assert stats["appended_rows"] == 0
@@ -391,32 +392,26 @@ def test_output_is_a_standalone_workbook(employees_bytes, emp_changes):
     assert openpyxl.load_workbook(io.BytesIO(updated.getvalue()))
 
 
-# --- Schedule-side view -----------------------------------------------------
+# --- The EOB-side view ------------------------------------------------------
 
-def test_schedule_visits_include_this_runs_fills(schedule_plan):
-    """The employees file is populated from post-run values."""
-    rows, plan = schedule_plan
-    visits = schedule_visits_from_plan(rows, plan)
-    castellano = next(
-        v for v in visits
-        if v.patient.startswith("Castellano") and v.session_date == date(2026, 3, 26)
-    )
-    # Blank in the sheet before the run; filled by this run's plan.
-    assert castellano.payment == 186.31
+def test_eob_visits_are_title_cased(all_visits):
+    """Medicare shouts; the tabs do not."""
+    castellano = next(v for v in eob_visits(all_visits)
+                      if v.patient.startswith("Castellano"))
+    assert castellano.patient == "Castellano, Miguel"
 
 
-def test_schedule_visits_are_deduped_by_patient_and_date(schedule_plan):
-    rows, plan = schedule_plan
-    visits = schedule_visits_from_plan(rows, plan)
-    keys = [(v.patient.lower(), v.session_date) for v in visits]
+def test_eob_visits_are_unique_per_patient_date_and_npi(all_visits):
+    keys = [(v.patient.lower(), v.session_date, v.npi) for v in eob_visits(all_visits)]
     assert len(keys) == len(set(keys))
 
 
-def test_telehealth_visit_carries_the_label(schedule_plan):
-    rows, plan = schedule_plan
-    visits = schedule_visits_from_plan(rows, plan)
-    petrossian = next(v for v in visits if v.patient.startswith("Petrossian"))
-    assert petrossian.insurance == "POS 10(95)"
+def test_eob_visit_amounts_come_straight_from_the_remit(all_visits):
+    castellano = next(v for v in eob_visits(all_visits)
+                      if v.patient.startswith("Castellano")
+                      and v.session_date == date(2026, 3, 26))
+    assert castellano.payment == 186.31
+    assert castellano.copay == 47.53
 
 
 # --- Summary / filename -----------------------------------------------------
@@ -429,6 +424,7 @@ def test_summary_counts(emp_changes):
         1 for c in emp_changes if c.action == EMP_ACTION_APPEND
     ) > 0
     assert counts["mismatch"] >= 1
+    assert counts["ambiguous"] >= 1
 
 
 def test_download_filename_has_no_patient_name():

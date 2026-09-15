@@ -1,13 +1,15 @@
-"""Marcia appends, the optional catch-all, and the employee audit columns.
+"""Marcia is fill-only again, and the employee audit columns.
 
-Two changes covered here:
+Two things covered here.
 
-* **Marcia now behaves like Ana and Oxana** -- she fills existing rows *and*
-  appends further sessions for patients already in her tab. She was previously
-  fill-only.
-* **Each provider tab gains `Processed On` and `Remit Check/EFT #`**, created
-  on that tab's own header row (Ana/Marcia row 1, Oxana row 2) and populated
-  only for rows the app filled or appended this run.
+* **Marcia fills but never appends.** Her sessions are billed incident-to
+  under the supervising physician's NPI, so the remit can never prove a visit
+  is hers -- her tab roster is what defines ownership. The roster-based append
+  and the `MARCIA_CATCH_ALL_UNASSIGNED` overflow bucket that shipped in 1.6.0
+  are both gone; a visit with no row waiting for it is listed, not placed.
+* **Each provider tab carries `Processed On` and `Remit Check/EFT #`**,
+  created on that tab's own header row (Ana/Marcia row 1, Oxana row 2) and
+  populated only for rows the app filled or appended this run.
 
 Every patient here is fictional (see `tests/fixtures/README.md`).
 """
@@ -19,67 +21,50 @@ from pathlib import Path
 
 import pytest
 
-from remit import employees as employees_module
+from remit import config
 from remit.config import (
     COL_CHECK_EFT,
     COL_PROCESSED_ON,
     DATE_FMT,
     EMP_ACTION_APPEND,
-    EMP_ACTION_AUTO_PLACED,
     EMP_ACTION_FILL,
     EMP_ACTION_UNASSIGNED,
     EMPLOYEE_APPEND_SHEETS,
+    EMPLOYEE_NPI,
     EMPLOYEE_SHEETS,
-    MARCIA_CATCH_ALL_UNASSIGNED,
 )
 from remit.employees import (
     build_updated_employees,
-    column_for,
     ensure_audit_columns,
+    eob_visits,
     find_header_row,
     header_key,
     load_employees_workbook,
     plan_employee_changes,
     read_sheets,
-    schedule_visits_from_plan,
 )
-from remit.excel_updater import (
-    get_schedule_sheet,
-    load_schedule_workbook,
-    read_schedule_rows,
-    resolve_columns,
-)
-from remit.matching import build_plan
 
-EMPLOYEES_XLSX = Path(__file__).parent / "fixtures" / "AMSMC_employees_sample.xlsx"
 STAMP = date(2026, 9, 10)
 STAMPED = STAMP.strftime(DATE_FMT)
 PAYING_EFT = "900000001"
+ASSOCIATES_EFT = "900000004"
 
 HEADER_ROWS = {"Ana": 1, "Marcia": 1, "Oxana": 2}
 
 
 @pytest.fixture()
-def employees_bytes() -> bytes:
-    return EMPLOYEES_XLSX.read_bytes()
+def sheets(employee_sheets):
+    return employee_sheets
 
 
 @pytest.fixture()
-def sheets(employees_bytes):
-    return read_sheets(load_employees_workbook(employees_bytes))
+def visits_for_tabs(all_visits):
+    return eob_visits(all_visits)
 
 
 @pytest.fixture()
-def schedule_visits(schedule_bytes, visits):
-    worksheet = get_schedule_sheet(load_schedule_workbook(schedule_bytes))
-    rows = read_schedule_rows(worksheet, resolve_columns(worksheet))
-    plan = build_plan(visits, rows, today=STAMP)
-    return schedule_visits_from_plan(rows, plan)
-
-
-@pytest.fixture()
-def changes(sheets, schedule_visits):
-    return plan_employee_changes(sheets, schedule_visits, today=STAMP)
+def changes(sheets, visits_for_tabs):
+    return plan_employee_changes(sheets, visits_for_tabs, today=STAMP)
 
 
 @pytest.fixture()
@@ -110,81 +95,91 @@ def tab_rows(workbook, name: str) -> list[dict]:
     return out
 
 
-# --- Change 1: Marcia appends ----------------------------------------------
+# --- Change 1: Marcia is fill-only ------------------------------------------
 
-def test_marcia_is_an_append_sheet():
-    assert set(EMPLOYEE_APPEND_SHEETS) == set(EMPLOYEE_SHEETS)
-    assert "Marcia" in EMPLOYEE_APPEND_SHEETS
+def test_marcia_is_not_an_append_sheet():
+    assert "Marcia" not in EMPLOYEE_APPEND_SHEETS
+    assert set(EMPLOYEE_APPEND_SHEETS) == {"Ana", "Oxana"}
+
+
+def test_marcia_has_no_npi_of_her_own():
+    """Which is *why* she is fill-only: no EOB can be attributed to her."""
+    assert "Marcia" not in EMPLOYEE_NPI
+    assert set(EMPLOYEE_NPI) == {"Ana", "Oxana"}
 
 
 def test_marcia_still_fills_existing_rows(changes):
-    fill = next(c for c in changes
-                if c.sheet == "Marcia" and c.action == EMP_ACTION_FILL)
-    assert fill.patient.startswith("Whitfield")
-    assert fill.session_date == "03/04/2026"
+    fills = [c for c in changes
+             if c.sheet == "Marcia" and c.action == EMP_ACTION_FILL]
+    assert {c.session_date for c in fills} == {"03/04/2026", "06/05/2026"}
+    assert all(c.patient.startswith("Whitfield") for c in fills)
 
 
-def test_marcia_appends_a_new_session_for_her_own_patient(changes):
-    append = next(c for c in changes
-                  if c.sheet == "Marcia" and c.action == EMP_ACTION_APPEND)
-    assert append.patient.startswith("Whitfield")
-    assert append.session_date == "04/02/2026"
-    assert append.accepted
+def test_marcia_never_appends_anything(changes):
+    assert not [c for c in changes
+                if c.sheet == "Marcia" and c.action == EMP_ACTION_APPEND]
+    assert not [c for c in changes if c.sheet == "Marcia" and c.appends]
 
 
-def test_marcia_append_lands_at_the_bottom_of_her_tab(applied):
+def test_a_marcia_visit_with_no_row_is_listed_not_added(changes):
+    """`Whitfield` 04/02 and 06/24 have no row waiting for them."""
+    for session in ("04/02/2026", "06/24/2026"):
+        change = next(c for c in changes
+                      if c.patient.startswith("Whitfield")
+                      and c.session_date == session)
+        assert change.action == EMP_ACTION_UNASSIGNED
+        assert change.sheet == ""
+        assert not change.accepted
+        assert not change.fills
+        assert "fill-only" in change.note
+
+
+def test_marcias_tab_keeps_exactly_its_original_rows(employees_bytes, applied):
+    before = tab_rows(load_employees_workbook(employees_bytes), "Marcia")
     workbook, _ = applied
-    rows = tab_rows(workbook, "Marcia")
-    assert len(rows) == 2
-    last = rows[-1]
-    assert last["Patient Name"] == "Whitfield, Harold"
-    assert last["Date of Session"] == "04/02/2026"
-    assert last["Paid by Insurance"] == 166.37
-    assert last["Co-pay by EOB"] == 42.44
+    after = tab_rows(workbook, "Marcia")
+    assert len(after) == len(before) == 3
+    assert [r["Date of Session"] for r in after] == [
+        "03/04/2026", "06/05/2026", "06/11/2026"
+    ]
 
 
-def test_marcia_appended_row_inherits_styling(applied):
-    workbook, _ = applied
-    worksheet = workbook["Marcia"]
-    template, appended = 2, 3
-    for column in (1, 2, 6):
-        assert (worksheet.cell(row=appended, column=column).number_format
-                == worksheet.cell(row=template, column=column).number_format)
-        assert (worksheet.cell(row=appended, column=column).font.name
-                == worksheet.cell(row=template, column=column).font.name)
-
-
-def test_marcia_does_not_double_add_on_a_rerun(employees_bytes, changes, schedule_visits):
+def test_marcia_does_not_double_add_on_a_rerun(employees_bytes, changes,
+                                               visits_for_tabs):
     updated, _ = build_updated_employees(employees_bytes, changes)
     once = updated.getvalue()
 
     reread = read_sheets(load_employees_workbook(once))
-    second = plan_employee_changes(reread, schedule_visits, today=STAMP)
+    second = plan_employee_changes(reread, visits_for_tabs, today=STAMP)
     _, stats = build_updated_employees(once, second)
 
     assert stats["appended_rows"] == 0
     assert stats["filled_cells"] == 0
-    assert len(tab_rows(load_employees_workbook(once), "Marcia")) == 2
+    assert len(tab_rows(load_employees_workbook(once), "Marcia")) == 3
 
 
-def test_marcia_comment_cross_check_still_applies(sheets, schedule_visits):
-    """A `Comment` naming another tab still blocks a silent placement."""
-    from remit.employees import _comment_conflict
+def test_the_practitioner_cross_check_skips_marcias_tab(visits_for_tabs):
+    """Her roster decides, so an associate NPI is not a conflict there."""
+    from remit.employees import _practitioner_conflict
 
-    marcia_visit = next(v for v in schedule_visits if v.patient.startswith("Whitfield"))
-    assert not _comment_conflict(marcia_visit, "Marcia")  # blank/physician comment
-
-    oxana_flagged = next(v for v in schedule_visits if v.comment == "Oxana")
-    assert _comment_conflict(oxana_flagged, "Marcia")
-
-
-# --- Change 1b: the optional catch-all -------------------------------------
-
-def test_catch_all_is_off_by_default():
-    assert MARCIA_CATCH_ALL_UNASSIGNED is False
+    oxana_visit = next(v for v in visits_for_tabs
+                       if v.patient.startswith("Beaumont"))
+    assert _practitioner_conflict(oxana_visit, "Ana") == "Oxana"
+    assert _practitioner_conflict(oxana_visit, "Oxana") == ""
+    assert _practitioner_conflict(oxana_visit, "Marcia") == ""
 
 
-def test_no_tab_patient_stays_unassigned_by_default(changes):
+# --- Change 1b: the catch-all is gone ---------------------------------------
+
+def test_the_catch_all_flag_no_longer_exists():
+    """`MARCIA_CATCH_ALL_UNASSIGNED` was removed with the roster append."""
+    assert not hasattr(config, "MARCIA_CATCH_ALL_UNASSIGNED")
+    assert not hasattr(config, "EMPLOYEE_CATCH_ALL_SHEET")
+    assert not hasattr(config, "EMP_ACTION_AUTO_PLACED")
+    assert not hasattr(config, "FALLBACK_TO_COMMENT_FOR_NEW")
+
+
+def test_no_tab_patient_stays_unassigned(changes):
     unassigned = [c for c in changes if c.action == EMP_ACTION_UNASSIGNED]
     assert unassigned
     for change in unassigned:
@@ -193,51 +188,15 @@ def test_no_tab_patient_stays_unassigned_by_default(changes):
         assert not change.fills
 
 
-def test_catch_all_appends_to_marcia_when_enabled(monkeypatch, sheets, schedule_visits):
-    monkeypatch.setattr(employees_module, "MARCIA_CATCH_ALL_UNASSIGNED", True)
-    changes = plan_employee_changes(sheets, schedule_visits, today=STAMP)
-
-    auto = [c for c in changes if c.action == EMP_ACTION_AUTO_PLACED]
-    assert auto
-    for change in auto:
-        assert change.sheet == "Marcia"
-        assert change.fills          # it would write, if accepted
-        assert not change.accepted   # ...but never without review
-        assert "auto-placed" in change.note
-    assert not [c for c in changes if c.action == EMP_ACTION_UNASSIGNED]
-
-
-def test_catch_all_rows_are_flagged_for_review(monkeypatch, sheets, schedule_visits):
-    monkeypatch.setattr(employees_module, "MARCIA_CATCH_ALL_UNASSIGNED", True)
-    changes = plan_employee_changes(sheets, schedule_visits, today=STAMP)
-    auto = next(c for c in changes if c.action == EMP_ACTION_AUTO_PLACED)
-    assert auto.needs_review
-
-
-def test_catch_all_writes_nothing_unless_accepted(monkeypatch, employees_bytes,
-                                                  sheets, schedule_visits):
-    monkeypatch.setattr(employees_module, "MARCIA_CATCH_ALL_UNASSIGNED", True)
-    changes = plan_employee_changes(sheets, schedule_visits, today=STAMP)
-
-    before = len(tab_rows(load_employees_workbook(employees_bytes), "Marcia"))
-    updated, _ = build_updated_employees(employees_bytes, changes)
-    after = tab_rows(load_employees_workbook(updated.getvalue()), "Marcia")
-    # Only the accepted Whitfield append lands; the auto-placed ones do not.
-    assert len(after) == before + 1
-
-
-def test_catch_all_rows_land_when_accepted(monkeypatch, employees_bytes,
-                                           sheets, schedule_visits):
-    monkeypatch.setattr(employees_module, "MARCIA_CATCH_ALL_UNASSIGNED", True)
-    changes = plan_employee_changes(sheets, schedule_visits, today=STAMP)
-    auto = [c for c in changes if c.action == EMP_ACTION_AUTO_PLACED]
-    for change in auto:
-        change.accepted = True
-
+def test_nothing_is_ever_swept_into_a_tab(employees_bytes, changes):
+    """Only NPI-matched appends land; everything else is reported."""
     updated, stats = build_updated_employees(employees_bytes, changes)
-    rows = tab_rows(load_employees_workbook(updated.getvalue()), "Marcia")
-    names = {r["Patient Name"] for r in rows}
-    assert any(c.patient in names for c in auto)
+    workbook = load_employees_workbook(updated.getvalue())
+    appended = sum(1 for c in changes if c.accepted and c.appends)
+    assert stats["appended_rows"] == appended == 2
+    assert {r["Patient Name"] for r in tab_rows(workbook, "Marcia")} == {
+        "Whitfield, Harold"
+    }
 
 
 # --- Change 2: audit columns ------------------------------------------------
@@ -301,18 +260,26 @@ def test_filled_rows_are_stamped(applied):
 
 def test_appended_rows_are_stamped(applied):
     workbook, _ = applied
-    row = next(r for r in tab_rows(workbook, "Marcia")
-               if r["Date of Session"] == "04/02/2026")
+    row = next(r for r in tab_rows(workbook, "Ana")
+               if r["Date of Session"] == "06/16/2026")
     assert row[COL_PROCESSED_ON] == STAMPED
-    assert row[COL_CHECK_EFT] == PAYING_EFT
+    assert row[COL_CHECK_EFT] == ASSOCIATES_EFT
 
 
-def test_untouched_rows_are_not_stamped(applied, changes):
+def test_the_stamped_eft_is_the_one_that_paid_this_visit(applied):
+    """Each row carries its own remit's number, not the run's first one."""
+    workbook, _ = applied
+    marcia = next(r for r in tab_rows(workbook, "Marcia")
+                  if r["Date of Session"] == "06/05/2026")
+    assert marcia[COL_CHECK_EFT] == ASSOCIATES_EFT
+
+
+def test_untouched_rows_are_not_stamped(applied):
     """The practitioner-mismatch row is never written to."""
     workbook, _ = applied
     row = next(r for r in tab_rows(workbook, "Ana")
-               if r["Date of Session"] == "03/09/2026")
-    assert row["Patient Name"] == "Marlowe, Diane"
+               if r["Date of Session"] == "06/10/2026")
+    assert row["Patient Name"] == "Beaumont, Sylvie"
     assert row[COL_PROCESSED_ON] is None
     assert row[COL_CHECK_EFT] is None
 
@@ -355,10 +322,11 @@ def test_audit_columns_only_on_tabs_that_were_written(employees_bytes, changes):
 
 # --- The EFT must be the paying remit's, never a duplicate's ---------------
 
-def test_check_eft_is_the_authoritative_one(changes):
+def test_check_eft_is_never_a_duplicates(changes):
+    known = {PAYING_EFT, ASSOCIATES_EFT}
     for change in changes:
         if change.check_eft:
-            assert change.check_eft == PAYING_EFT
+            assert change.check_eft in known
 
 
 def test_a_duplicate_eft_never_reaches_the_employees_file():
@@ -378,6 +346,11 @@ def test_a_duplicate_eft_never_reaches_the_employees_file():
     assert DUPLICATE_CHECK_EFT not in (restated.authoritative_eft or "")
     # ...even though the duplicate is still on the audit trail.
     assert DUPLICATE_CHECK_EFT in restated.check_efts
+
+    # And the EOB-side view carries only the paying number forward.
+    carried = next(v for v in eob_visits(visits)
+                   if v.session_date == restated.service_date)
+    assert carried.check_eft == DEDUCT_CHECK_EFT
 
 
 def test_several_authoritative_remits_are_joined():
@@ -412,11 +385,11 @@ def test_existing_employee_values_are_untouched(applied):
 
 def test_unmapped_columns_stay_blank_on_appends(applied):
     workbook, _ = applied
-    row = next(r for r in tab_rows(workbook, "Marcia")
-               if r["Date of Session"] == "04/02/2026")
+    row = next(r for r in tab_rows(workbook, "Ana")
+               if r["Date of Session"] == "06/16/2026")
     assert row["Memo"] is None
     assert row["Billed"] is None
-    assert row["Paid to Marcia"] is None
+    assert row["Paid to Ana"] is None
 
 
 def test_every_sheet_survives(applied):

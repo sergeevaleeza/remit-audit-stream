@@ -276,3 +276,28 @@ def test_streamlit_script_runs_without_error():
     app = AppTest.from_file("streamlit_app.py", default_timeout=60).run()
     assert not app.exception, [str(e) for e in app.exception]
     assert any("Upload the schedule workbook" in str(info.value) for info in app.info)
+
+
+def test_the_cutoff_input_defaults_to_empty():
+    """Data is never dropped unless the user sets a date."""
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file("streamlit_app.py", default_timeout=60).run()
+    assert not app.exception, [str(e) for e in app.exception]
+
+    cutoff = next(w for w in app.date_input
+                  if "Ignore visits before" in w.label)
+    assert cutoff.value is None
+    assert any("no cutoff" in str(c.value) for c in app.caption)
+
+
+def test_setting_the_cutoff_is_reflected_in_the_page():
+    """The widget is wired to the label the preview and the plan both use."""
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file("streamlit_app.py", default_timeout=60).run()
+    cutoff = next(w for w in app.date_input if "Ignore visits before" in w.label)
+
+    app = cutoff.set_value(date(2026, 7, 1)).run()
+    assert not app.exception, [str(e) for e in app.exception]
+    assert any("on/after 07/01/2026" in str(c.value) for c in app.caption)

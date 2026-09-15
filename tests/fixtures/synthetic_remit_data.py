@@ -363,3 +363,94 @@ DUPLICATE_FIXTURE_NEW_VISIT = ("2026-02-25", 0.00, 26.60, 104.27, 2.13)
 
 #: A visit seen ONLY as a duplicate: the remit that paid it was never uploaded.
 DUPLICATE_ONLY_DATE = "2026-07-07"
+
+
+# --- Fourth fixture: visits billed under the associates' own NPIs ----------
+#
+# The employees workbook appends a visit to a tab only when the EOB's PERF
+# PROV NPI is that associate's own. Every other fixture bills under a single
+# physician NPI, which cannot exercise that gate, so this remit carries three
+# different performing providers for four fictional patients.
+#
+# The real clinic's associate NPIs are never committed (see
+# `remit/config.py`); these synthetic ones match the synthetic defaults in
+# `EMPLOYEE_NPI` and `NPI_TO_DOCTOR`.
+
+ASSOCIATES_HEADER_DATE = "09/04/26"  # -> 09/04/2026
+ASSOCIATES_CHECK_EFT = "900000004"
+
+#: The associates who bill under their own NPI, by employees-tab name.
+ANA_NPI = "1000000011"
+OXANA_NPI = "1000000012"
+
+#: The supervising physician. Marcia's sessions bill under this NPI
+#: (incident-to), which is exactly why the EOB can never prove one is hers.
+SUPERVISING_NPI = SYNTHETIC_PROVIDER_NPI      # "1000000001", Dr. A
+SECOND_PHYSICIAN_NPI = "1000000002"           # Dr. B
+
+#: (printed name, MBI seed, account, [(iso date, npi, cpt), ...])
+#:
+#: Each line below is one whole claim block, so a patient seen twice on one
+#: day by two providers yields two reconciled visits sharing patient + date --
+#: the ambiguous-match case.
+ASSOCIATES_CLAIMS: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
+    # Ana's own patient. 06/02 is in Ana's tab (fill) and was also billed that
+    # day by the physician, so the tab's NPI has to break the tie. 06/16 is
+    # missing from her tab and carries her NPI -> appended. 06/09 is missing
+    # too but carries the PHYSICIAN's NPI -> must NOT be appended, even though
+    # Ana's tab plainly knows this patient.
+    ("RAVENSWORTH, CECILY", "0301", "RAVENC", [
+        ("2026-06-02", ANA_NPI, "99213"),
+        ("2026-06-02", ANA_NPI, "90833"),
+    ]),
+    ("RAVENSWORTH, CECILY", "0301", "RAVENC", [
+        ("2026-06-02", SUPERVISING_NPI, "99214"),
+    ]),
+    ("RAVENSWORTH, CECILY", "0301", "RAVENC", [
+        ("2026-06-16", ANA_NPI, "99213"),
+        ("2026-06-16", ANA_NPI, "90836"),
+    ]),
+    ("RAVENSWORTH, CECILY", "0301", "RAVENC", [
+        ("2026-06-09", SUPERVISING_NPI, "99213"),
+        ("2026-06-09", SUPERVISING_NPI, "90833"),
+    ]),
+
+    # Oxana's own patient: 06/03 fills her tab, 06/17 is appended to it.
+    ("NAKAMURA, HIROSHI", "0302", "NAKAMH", [
+        ("2026-06-03", OXANA_NPI, "99213"),
+        ("2026-06-03", OXANA_NPI, "90836"),
+    ]),
+    ("NAKAMURA, HIROSHI", "0302", "NAKAMH", [
+        ("2026-06-17", OXANA_NPI, "99214"),
+    ]),
+
+    # Sits in BOTH Ana's and Oxana's tab on 06/10, billed under Oxana's NPI:
+    # Oxana's row fills, Ana's row is flagged *practitioner mismatch*.
+    ("BEAUMONT, SYLVIE", "0303", "BEAUMS", [
+        ("2026-06-10", OXANA_NPI, "99213"),
+        ("2026-06-10", OXANA_NPI, "90833"),
+    ]),
+
+    # Marcia's patient, billed incident-to. 06/05 fills her existing row --
+    # a supervising NPI is not a conflict. 06/11 was billed by two different
+    # physicians, and Marcia has no NPI to break the tie -> needs review.
+    # 06/24 has no row waiting for it, and Marcia never appends.
+    ("WHITFIELD, HAROLD", "0003", "WHITFH", [
+        ("2026-06-05", SUPERVISING_NPI, "99214"),
+    ]),
+    ("WHITFIELD, HAROLD", "0003", "WHITFH", [
+        ("2026-06-11", SUPERVISING_NPI, "99213"),
+    ]),
+    ("WHITFIELD, HAROLD", "0003", "WHITFH", [
+        ("2026-06-11", SECOND_PHYSICIAN_NPI, "90833"),
+    ]),
+    ("WHITFIELD, HAROLD", "0003", "WHITFH", [
+        ("2026-06-24", SUPERVISING_NPI, "99213"),
+        ("2026-06-24", SUPERVISING_NPI, "90833"),
+    ]),
+]
+
+
+def associates_mbi(seed: str) -> str:
+    """The MBI-shaped placeholder for one ASSOCIATES_CLAIMS seed."""
+    return _mbi(seed)

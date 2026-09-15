@@ -97,6 +97,9 @@ _SYNTHETIC_NPI_TO_DOCTOR = {
     "1000000001": "Dr. A",
     "1000000002": "Dr. B",
     "1000000003": "Dr. C",
+    # The two associates who bill under their own NPI -- see EMPLOYEE_NPI.
+    "1000000011": "Ana",
+    "1000000012": "Oxana",
 }
 
 #: Group billing NPI that appears in the page header and must never be used
@@ -104,11 +107,11 @@ _SYNTHETIC_NPI_TO_DOCTOR = {
 GROUP_BILLING_NPI = os.environ.get("REMIT_GROUP_NPI", "1000000000")
 
 
-def _load_local_npi_map() -> dict[str, str] | None:
-    """A gitignored JSON file with the clinic's real NPI -> doctor mapping."""
-    env_path = os.environ.get("REMIT_NPI_MAP_PATH")
+def _load_local_map(env_var: str, filename: str) -> dict[str, str] | None:
+    """A gitignored JSON file holding one of the clinic's real mappings."""
+    env_path = os.environ.get(env_var)
     repo_root = Path(__file__).resolve().parent.parent
-    for candidate in filter(None, (env_path, repo_root / "npi_map.local.json")):
+    for candidate in filter(None, (env_path, repo_root / filename)):
         path = Path(candidate)
         if not path.is_file():
             continue
@@ -117,25 +120,29 @@ def _load_local_npi_map() -> dict[str, str] | None:
         except (OSError, ValueError):
             continue
         if isinstance(data, dict) and data:
-            return {str(npi): str(name) for npi, name in data.items()}
+            return {str(key): str(value) for key, value in data.items()}
     return None
 
 
-def _load_secrets_npi_map() -> dict[str, str] | None:
-    """An `[npi_to_doctor]` table in Streamlit secrets, when deployed."""
+def _load_secrets_map(table_name: str) -> dict[str, str] | None:
+    """A `[<table_name>]` table in Streamlit secrets, when deployed."""
     try:
         import streamlit as st
 
-        table = st.secrets.get("npi_to_doctor")
+        table = st.secrets.get(table_name)
     except Exception:
         return None
     if table:
-        return {str(npi): str(name) for npi, name in dict(table).items()}
+        return {str(key): str(value) for key, value in dict(table).items()}
     return None
 
 
 def _resolve_npi_to_doctor() -> dict[str, str]:
-    return _load_local_npi_map() or _load_secrets_npi_map() or dict(_SYNTHETIC_NPI_TO_DOCTOR)
+    return (
+        _load_local_map("REMIT_NPI_MAP_PATH", "npi_map.local.json")
+        or _load_secrets_map("npi_to_doctor")
+        or dict(_SYNTHETIC_NPI_TO_DOCTOR)
+    )
 
 
 NPI_TO_DOCTOR = _resolve_npi_to_doctor()
@@ -211,52 +218,64 @@ EMPLOYEE_COL_INSURANCE = "Insurance"
 EMPLOYEE_COL_COPAY_EOB = "Co-pay by EOB"
 EMPLOYEE_COL_DATE = "Date of Session"
 
-#: Tabs the app may append brand-new visits to. Marcia's tab is fill-only.
-#: Tabs the app may append new visits to. All three behave the same way: a
-#: patient already present in a tab gets their further sessions appended to
-#: the end of it.
-EMPLOYEE_APPEND_SHEETS = ("Ana", "Marcia", "Oxana")
+# --- Which tab owns which PERF PROV NPI -------------------------------------
+#
+# Appends are gated on the **EOB's** performing-provider NPI, not on who the
+# tab roster already contains. An associate who bills under her own NPI owns
+# every visit carrying it; Marcia has no NPI of her own, because her sessions
+# are billed incident-to under the supervising physician, so her tab roster --
+# not the remit -- defines what is hers. That is why she is fill-only.
+#
+# Like NPI_TO_DOCTOR, the real values are NEVER committed. The default below
+# is a synthetic placeholder for local development and the test suite. To use
+# real values, either:
+#
+#   1. Copy `employee_npi.example.json` to `employee_npi.local.json` (repo
+#      root) and fill in the real tab -> NPI pairs. That file is gitignored.
+#   2. On Streamlit Community Cloud, add an `[employee_npi]` table to the
+#      app's Secrets instead of shipping a file.
 
-#: Tab that optionally absorbs visits for patients who appear in NO provider
-#: tab. Off by default -- see MARCIA_CATCH_ALL_UNASSIGNED below.
-EMPLOYEE_CATCH_ALL_SHEET = "Marcia"
+_SYNTHETIC_EMPLOYEE_NPI = {
+    "Ana": "1000000011",
+    "Oxana": "1000000012",
+}
 
-#: When True, a schedule visit whose patient is in no provider tab is appended
-#: to the end of Marcia's tab and flagged *auto-placed*. When False (default)
-#: it is listed as *Unassigned - needs manual placement* and nothing is written.
-#:
-#: WARNING: most visits bill under the supervising physician's NPI
-#: (incident-to), so a large share of "no tab" patients are that physician's
-#: OWN direct patients who legitimately belong in no associate's tab. Turning
-#: this on sweeps all of them into Marcia's tab, turning it into an overflow
-#: bucket. Leave it False unless that is explicitly what is wanted.
-MARCIA_CATCH_ALL_UNASSIGNED = False
+
+def _resolve_employee_npi() -> dict[str, str]:
+    return (
+        _load_local_map("REMIT_EMPLOYEE_NPI_PATH", "employee_npi.local.json")
+        or _load_secrets_map("employee_npi")
+        or dict(_SYNTHETIC_EMPLOYEE_NPI)
+    )
+
+
+#: Provider tab -> that associate's own PERF PROV NPI.
+EMPLOYEE_NPI = _resolve_employee_npi()
+
+#: Tabs the app may append brand-new visits to: exactly those with an NPI of
+#: their own. Marcia is fill-only -- her sessions bill under the supervising
+#: physician's NPI, so an EOB can never prove a visit is hers.
+EMPLOYEE_APPEND_SHEETS = tuple(
+    name for name in EMPLOYEE_SHEETS if name in EMPLOYEE_NPI
+)
 
 #: Audit columns the app maintains on each provider tab, appended after that
 #: tab's existing headers (respecting its own header-row position).
 EMPLOYEE_AUDIT_COLUMNS = (COL_PROCESSED_ON, COL_CHECK_EFT)
 
-#: `all_matching` syncs every matching schedule visit into the tabs, deduped
-#: by patient + Date of Session so nothing is added twice.
+#: `all_matching` syncs every reconciled EOB visit into the tabs, deduped by
+#: patient + Date of Session so nothing is added twice.
 EMPLOYEES_SCOPE = "all_matching"
-
-#: A patient in no provider tab cannot be assigned by name. With False they
-#: are listed as unassigned; with True a brand-new patient is appended to the
-#: tab named by their schedule `Comment`.
-FALLBACK_TO_COMMENT_FOR_NEW = False
 
 # --- Employees actions ------------------------------------------------------
 
 EMP_ACTION_FILL = "Fill existing row"
-EMP_ACTION_APPEND = "Append new row"
-EMP_ACTION_NO_MATCH = "No Schedule match"
+EMP_ACTION_APPEND = "Append new row (NPI-matched)"
+EMP_ACTION_NO_MATCH = "No EOB match"
 EMP_ACTION_MISMATCH = "Practitioner mismatch - needs review"
+EMP_ACTION_AMBIGUOUS = "Ambiguous EOB match - needs review"
 EMP_ACTION_UNASSIGNED = "Unassigned - needs manual placement"
 EMP_ACTION_NOTHING = "Nothing to fill"
-
-#: Only reachable with MARCIA_CATCH_ALL_UNASSIGNED on: a no-tab patient swept
-#: into the catch-all tab. Always surfaced for review, never silent.
-EMP_ACTION_AUTO_PLACED = "Append (auto-placed, unassigned) - review"
 
 # --- Name normalisation -----------------------------------------------------
 

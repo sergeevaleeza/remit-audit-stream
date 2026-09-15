@@ -1,18 +1,27 @@
-"""Populate `AMSMC_employees.xlsx` from the reconciled `2026 Medicare` sheet.
+"""Populate `AMSMC_employees.xlsx` directly from the reconciled EOB visits.
 
-One sheet per practitioner (Ana, Marcia, Oxana). Two things make this less
-mechanical than it looks:
+One sheet per practitioner (Ana, Marcia, Oxana). The tabs are fed from the
+same reconciled visit set that feeds the schedule, taken *after* OA-18 /
+multi-EFT reconciliation -- the two are independent consumers of it, and this
+module never reads a schedule cell. That matters because the schedule's own
+values can lag or be hand-edited, whereas the EOB is what Medicare actually
+adjudicated.
+
+Three things make this less mechanical than it looks:
 
 * **The header row is not in the same place on every sheet** -- Ana and Marcia
   put it on row 1, Oxana on row 2 -- so it is located by scanning the first
   rows for the expected labels rather than assumed. Labels also carry odd
   internal spacing (`Co-payment   Old`, `Paid by Ins toAna`), so they are
   matched case-insensitively with whitespace collapsed.
-* **Who belongs to whom is decided by the tabs, not by the remit.** Staff
-  curate these sheets, so a patient's presence in a tab is the source of
-  truth. The schedule's `Comment` (derived from the remit NPI) is only a
-  secondary cross-check, because an older visit may have been seen by a
-  different practitioner.
+* **Appends are gated on the EOB's PERF PROV NPI**, not on who a tab already
+  contains. A visit is appended to Ana's or Oxana's tab only when it was
+  billed under that associate's own NPI, so a patient being "known" to a tab
+  can never pull in a session somebody else performed.
+* **Marcia is fill-only.** Her sessions are billed incident-to under the
+  supervising physician's NPI, so the remit can never prove a visit is hers.
+  Her tab roster defines ownership: existing rows are filled, nothing is ever
+  added.
 """
 
 from __future__ import annotations
@@ -28,8 +37,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from .config import (
     DATE_FMT,
+    EMP_ACTION_AMBIGUOUS,
     EMP_ACTION_APPEND,
-    EMP_ACTION_AUTO_PLACED,
     EMP_ACTION_FILL,
     EMP_ACTION_MISMATCH,
     EMP_ACTION_NO_MATCH,
@@ -37,18 +46,16 @@ from .config import (
     EMP_ACTION_UNASSIGNED,
     EMPLOYEE_APPEND_SHEETS,
     EMPLOYEE_AUDIT_COLUMNS,
-    EMPLOYEE_CATCH_ALL_SHEET,
     EMPLOYEE_COL_COPAY_EOB,
     COL_CHECK_EFT,
     COL_PROCESSED_ON,
     EMPLOYEE_COL_DATE,
     EMPLOYEE_COL_INSURANCE,
     EMPLOYEE_HEADER_SEARCH_ROWS,
+    EMPLOYEE_NPI,
     EMPLOYEE_PATIENT_HEADERS,
     EMPLOYEE_PAYMENT_COLUMN,
     EMPLOYEE_SHEETS,
-    FALLBACK_TO_COMMENT_FOR_NEW,
-    MARCIA_CATCH_ALL_UNASSIGNED,
     NAME_AUTO_MATCH_SCORE,
 )
 from .matching import (
@@ -165,6 +172,18 @@ class EmployeeSheet:
             for row in self.rows
         )
 
+    def has_session(self, patient: str, session_date: date) -> bool:
+        """True when this tab already carries that patient on that date.
+
+        The dedup key for appends, so re-running a remit adds nothing.
+        """
+        return any(
+            not is_blank(row.patient)
+            and row.parsed_date == session_date
+            and name_score(patient, str(row.patient)) >= NAME_AUTO_MATCH_SCORE
+            for row in self.rows
+        )
+
 
 @dataclass
 class EmployeeChange:
@@ -182,6 +201,9 @@ class EmployeeChange:
     fills: dict[int, Any] = field(default_factory=dict)
     note: str = ""
     accepted: bool = True
+    #: The EOB's PERF PROV NPI, shown in the preview so the reason an append
+    #: did or did not happen is visible without opening the remit.
+    npi: str = ""
     #: Audit stamps written to this tab's own columns for rows touched now.
     processed_on: str = ""
     check_eft: str = ""
@@ -189,18 +211,16 @@ class EmployeeChange:
     @property
     def needs_review(self) -> bool:
         return self.action in (
-            EMP_ACTION_MISMATCH, EMP_ACTION_UNASSIGNED, EMP_ACTION_AUTO_PLACED,
+            EMP_ACTION_MISMATCH, EMP_ACTION_AMBIGUOUS, EMP_ACTION_UNASSIGNED,
         )
 
     @property
     def writes(self) -> bool:
-        return self.action in (
-            EMP_ACTION_FILL, EMP_ACTION_APPEND, EMP_ACTION_AUTO_PLACED,
-        )
+        return self.action in (EMP_ACTION_FILL, EMP_ACTION_APPEND)
 
     @property
     def appends(self) -> bool:
-        return self.action in (EMP_ACTION_APPEND, EMP_ACTION_AUTO_PLACED)
+        return self.action == EMP_ACTION_APPEND
 
 
 def load_employees_workbook(data: bytes) -> openpyxl.Workbook:
@@ -259,106 +279,86 @@ def read_sheets(workbook: openpyxl.Workbook) -> dict[str, EmployeeSheet]:
     return sheets
 
 
-# --- Schedule-side view -----------------------------------------------------
+# --- EOB-side view ----------------------------------------------------------
 
 @dataclass(frozen=True)
-class ScheduleVisit:
-    """The schedule facts the employees file needs, after the run's changes."""
+class EobVisit:
+    """One reconciled EOB visit, in the shape the employees tabs need.
+
+    Built from the same `pdf_parser.Visit` objects the schedule is planned
+    from, *after* reconciliation, so an OA-18 duplicate can never supply the
+    amounts or the check/EFT number.
+    """
 
     patient: str
     session_date: date
+    npi: str
     insurance: str
     copay: Any
     payment: Any
-    comment: str = ""
-    #: The paying remit's check/EFT number for this visit -- per the OA-18
-    #: rule this is never a duplicate's number.
+    #: The paying remit's check/EFT number -- per the OA-18 rule this is never
+    #: a duplicate's.
     check_eft: str = ""
+    #: Set when the visit itself is unsafe to record (currently: every
+    #: occurrence was an OA-18 duplicate, so no remit actually paid it). Any
+    #: change built from it is surfaced for review and never auto-accepted.
+    review_note: str = ""
 
     @property
     def date_str(self) -> str:
         return self.session_date.strftime(DATE_FMT)
 
+    @property
+    def provider_tab(self) -> str | None:
+        """The provider tab that owns this visit's NPI, if any."""
+        return tab_for_npi(self.npi)
 
-def schedule_visits_from_plan(rows, changes) -> list[ScheduleVisit]:
-    """The schedule as it will look *after* this run's accepted changes.
+    @property
+    def key(self) -> tuple[str, date, str]:
+        """Identity: the same (patient, date, NPI) key reconciliation used."""
+        return (_normalize_token(self.patient), self.session_date, self.npi)
 
-    Existing rows contribute their current values, overlaid with anything the
-    run fills or restates, so the employees file is populated from the same
-    numbers the user is about to download.
+
+def tab_for_npi(npi: str) -> str | None:
+    """The provider tab whose associate bills under this PERF PROV NPI.
+
+    Returns ``None`` for a supervising physician's NPI or one the app does not
+    know -- neither says anything about which associate performed the session,
+    so neither is ever treated as a conflict.
     """
-    from .config import COL_COMMENT, COL_COPAY, COL_PAYMENT
+    for name, owner in EMPLOYEE_NPI.items():
+        if owner and str(owner) == str(npi):
+            return name
+    return None
 
-    pending: dict[int, dict[str, Any]] = {}
-    # The paying remit's EFT for each schedule row this run touched. Taken
-    # from the visit's authoritative occurrence, so an OA-18 duplicate's
-    # number can never end up in the employees audit column.
-    paying_eft: dict[int, str] = {}
-    for change in changes:
-        if not change.accepted or change.row_num is None:
-            continue
-        merged = dict(change.fills)
-        merged.update(change.updates)
-        if merged:
-            pending.setdefault(change.row_num, {}).update(merged)
-        if merged and change.visit is not None and change.visit.authoritative_eft:
-            paying_eft[change.row_num] = change.visit.authoritative_eft
 
-    visits: list[ScheduleVisit] = []
-    seen: set[tuple[tuple[str, str], date]] = set()
+def eob_visits(visits: Sequence[Any]) -> list[EobVisit]:
+    """The reconciled remittance visits, as the employees workbook sees them.
 
-    def add(patient, session_date, insurance, copay, payment, comment, check_eft=""):
-        if is_blank(patient) or session_date is None:
-            return
-        from .matching import split_name
-
-        key = (split_name(str(patient)), session_date)
-        if key in seen:
-            return
-        seen.add(key)
-        visits.append(
-            ScheduleVisit(
-                patient=str(patient),
-                session_date=session_date,
-                insurance=str(insurance or "").strip(),
-                copay=copay,
-                payment=payment,
-                comment="" if is_blank(comment) else str(comment).strip(),
-                check_eft="" if is_blank(check_eft) else str(check_eft).strip(),
+    Takes `pdf_parser.Visit` objects straight from aggregation -- the same
+    list `build_plan` receives -- so the tabs and the schedule are populated
+    from one source and cannot drift apart. Names are title-cased to the
+    tabs' own style; nothing is read back out of the schedule.
+    """
+    built: list[EobVisit] = []
+    for visit in visits:
+        built.append(
+            EobVisit(
+                patient=to_title_name(visit.patient),
+                session_date=visit.service_date,
+                npi=str(visit.npi),
+                insurance=visit.insurance,
+                copay=visit.copay,
+                payment=visit.payment,
+                check_eft=visit.authoritative_eft or "",
+                # A visit seen only as an exact duplicate was adjudicated at
+                # $0 because the paying remit was never uploaded. Recording
+                # that $0 in a provider's pay sheet would be wrong, so it is
+                # shown and left for a human instead.
+                review_note=visit.duplicate_note if visit.duplicate_only else "",
             )
         )
-
-    for row in rows:
-        overlay = pending.get(row.row_num, {})
-        add(
-            row.patient,
-            row.data_date,
-            overlay.get("Ins", row.ins),
-            overlay.get(COL_COPAY, row.copay),
-            overlay.get(COL_PAYMENT, row.payment),
-            overlay.get(COL_COMMENT, row.comment),
-            # This run's paying remit if it touched the row, else whatever the
-            # schedule already recorded from an earlier run.
-            paying_eft.get(row.row_num) or row.check_eft,
-        )
-
-    # Rows this run appends do not exist in `rows` yet.
-    for change in changes:
-        if not change.accepted or change.row_num is not None:
-            continue
-        if not getattr(change, "visit", None):
-            continue
-        add(
-            to_title_name(change.visit.patient),
-            change.visit.service_date,
-            change.visit.insurance,
-            change.visit.copay,
-            change.visit.payment,
-            change.visit.doctor,
-            change.visit.authoritative_eft or "",
-        )
-
-    return visits
+    return built
 
 
 # --- Planning ---------------------------------------------------------------
@@ -367,39 +367,61 @@ def _same_person(left: str, right: str) -> bool:
     return name_score(left, right) >= NAME_AUTO_MATCH_SCORE
 
 
-def names_a_provider_tab(comment: str) -> str | None:
-    """The provider tab a `Comment` names, if it names one at all.
+def _practitioner_conflict(visit: EobVisit, sheet_name: str) -> str:
+    """The *other* associate this visit was billed under, if it was one.
 
-    `Comment` comes from the remit's performing-provider NPI, so it usually
-    holds a *physician's* name (`Dr. Levinson`) rather than one of the three
-    employee tabs. A physician name says nothing about which tab a session
-    belongs to, so only a comment that actually matches a tab is a usable
-    cross-check.
+    Only meaningful on a tab whose associate has an NPI of her own. A
+    supervising physician's NPI (the incident-to case) is never a conflict:
+    it is the ordinary way an associate's session is billed and says nothing
+    about who performed it. Marcia's tab is exempt entirely -- her roster,
+    not the remit, decides what is hers.
     """
-    if not comment:
-        return None
-    key = _normalize_token(comment)
-    for name in EMPLOYEE_SHEETS:
-        if key == _normalize_token(name):
-            return name
-    return None
+    if sheet_name not in EMPLOYEE_APPEND_SHEETS:
+        return ""
+    owner = visit.provider_tab
+    if owner is None or _normalize_token(owner) == _normalize_token(sheet_name):
+        return ""
+    return owner
 
 
-def _comment_conflict(visit: ScheduleVisit, sheet_name: str) -> bool:
-    """True when the schedule `Comment` names a *different provider tab*.
+def _matches_for(visits: Sequence[EobVisit], patient: Any,
+                 session_date: date | None) -> list[EobVisit]:
+    """Every reconciled EOB visit for this patient on this date."""
+    if session_date is None or is_blank(patient):
+        return []
+    return [
+        visit for visit in visits
+        if visit.session_date == session_date
+        and _same_person(str(patient), visit.patient)
+    ]
 
-    A blank `Comment`, or one naming a physician who is not one of the tabs,
-    is never a conflict: it carries no signal about which tab is correct, and
-    treating it as one would flag essentially every row.
+
+def _pick_match(matches: Sequence[EobVisit],
+                sheet_name: str) -> tuple[EobVisit, str]:
+    """(the visit to use, why it is ambiguous -- blank when it is not).
+
+    Several reconciled visits can share a patient and date when two providers
+    both billed that day. The tab's own NPI settles it; on Marcia's tab, or
+    when the tie survives, nothing is chosen silently.
     """
-    named = names_a_provider_tab(visit.comment)
-    if named is None:
-        return False
-    return _normalize_token(named) != _normalize_token(sheet_name)
+    if len(matches) == 1:
+        return matches[0], ""
+
+    own = EMPLOYEE_NPI.get(sheet_name)
+    if own:
+        preferred = [visit for visit in matches if visit.npi == str(own)]
+        if len(preferred) == 1:
+            return preferred[0], ""
+
+    npis = ", ".join(sorted({visit.npi for visit in matches}))
+    return matches[0], (
+        f"{len(matches)} EOB visits match this patient and date (NPIs {npis})"
+        + ("" if own else f"; {sheet_name} has no NPI of her own to resolve it")
+    )
 
 
 def _mapped_fills(sheet: EmployeeSheet, row_values: dict[str, Any],
-                  visit: ScheduleVisit) -> dict[int, Any]:
+                  visit: EobVisit) -> dict[int, Any]:
     """Blank mapped cells and what to put in them, as {column index: value}."""
     proposals = [
         (column_for(sheet.columns, EMPLOYEE_COL_INSURANCE), visit.insurance),
@@ -417,29 +439,47 @@ def _mapped_fills(sheet: EmployeeSheet, row_values: dict[str, Any],
     return fills
 
 
+def _change_from(visit: EobVisit, sheet: EmployeeSheet, action: str,
+                 **kwargs: Any) -> EmployeeChange:
+    """An EmployeeChange carrying this visit's mapped values."""
+    return EmployeeChange(
+        sheet=sheet.name,
+        action=action,
+        patient=visit.patient,
+        session_date=visit.date_str,
+        insurance=visit.insurance,
+        copay=visit.copay,
+        payment=visit.payment,
+        payment_column=EMPLOYEE_PAYMENT_COLUMN.get(sheet.name, ""),
+        npi=visit.npi,
+        check_eft=visit.check_eft,
+        **kwargs,
+    )
+
+
 def plan_employee_changes(sheets: dict[str, EmployeeSheet],
-                          visits: Sequence[ScheduleVisit],
+                          visits: Sequence[EobVisit],
                           today: date | None = None) -> list[EmployeeChange]:
-    """Decide what each provider sheet should get from the schedule."""
+    """Decide what each provider sheet should get from the reconciled EOBs.
+
+    Two independent passes. Every tab has its existing rows *filled* from the
+    matching EOB visit; only the tabs whose associate has an NPI of her own
+    additionally have NPI-matching visits *appended*. A visit that does
+    neither is listed rather than guessed at.
+    """
     stamp = (today or date.today()).strftime(DATE_FMT)
     changes: list[EmployeeChange] = []
-    matched_visits: set[tuple[str, date]] = set()
+    #: Visits that filled a row or were appended somewhere, by their
+    #: (patient, date, NPI) key -- the one reconciliation already made unique.
+    placed: set[tuple[str, date, str]] = set()
 
     # 1. Fill rows the tabs already have, matched by patient + Date of Session.
     for sheet in sheets.values():
-        payment_label = EMPLOYEE_PAYMENT_COLUMN.get(sheet.name, "")
         for row in sheet.rows:
             row_date = row.parsed_date
-            match = next(
-                (
-                    visit for visit in visits
-                    if visit.session_date == row_date
-                    and _same_person(str(row.patient), visit.patient)
-                ),
-                None,
-            ) if row_date else None
+            matches = _matches_for(visits, row.patient, row_date)
 
-            if match is None:
+            if not matches:
                 changes.append(EmployeeChange(
                     sheet=sheet.name,
                     action=EMP_ACTION_NO_MATCH,
@@ -450,195 +490,98 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
                 ))
                 continue
 
-            matched_visits.add((_key_of(match.patient), match.session_date))
-
-            if _comment_conflict(match, sheet.name):
-                changes.append(EmployeeChange(
-                    sheet=sheet.name,
-                    action=EMP_ACTION_MISMATCH,
-                    patient=str(row.patient),
-                    session_date=match.date_str,
-                    row_num=row.row_num,
-                    insurance=match.insurance,
-                    copay=match.copay,
-                    payment=match.payment,
-                    payment_column=payment_label,
-                    fills=_mapped_fills(sheet, row.values, match),
-                    note=(
-                        f"Schedule Comment says '{match.comment}', but this is "
-                        f"the {sheet.name} tab"
-                    ),
-                    accepted=False,
-                ))
-                continue
-
+            match, ambiguity = _pick_match(matches, sheet.name)
+            placed.add(match.key)
             fills = _mapped_fills(sheet, row.values, match)
-            changes.append(EmployeeChange(
-                sheet=sheet.name,
-                action=EMP_ACTION_FILL if fills else EMP_ACTION_NOTHING,
-                patient=str(row.patient),
-                session_date=match.date_str,
-                row_num=row.row_num,
-                insurance=match.insurance,
-                copay=match.copay,
-                payment=match.payment,
-                payment_column=payment_label,
-                fills=fills,
-                accepted=bool(fills),
-            ))
 
-    # 2. Append the remaining visits of patients already established in a tab.
-    for visit in visits:
-        if (_key_of(visit.patient), visit.session_date) in matched_visits:
-            continue
+            if ambiguity:
+                changes.append(_change_from(
+                    match, sheet, EMP_ACTION_AMBIGUOUS,
+                    row_num=row.row_num, fills=fills,
+                    note=f"{ambiguity} - confirm which one belongs here",
+                    accepted=False,
+                ))
+                continue
 
-        homes = [name for name, sheet in sheets.items() if sheet.has_patient(visit.patient)]
-
-        if not homes:
-            changes.append(_unassigned(visit, sheets))
-            continue
-
-        target = homes[0]
-        note = ""
-        if len(homes) > 1:
-            # Present in several tabs: the Comment is the only signal left.
-            by_comment = [name for name in homes if not _comment_conflict(visit, name)]
-            if visit.comment and len(by_comment) == 1:
-                target = by_comment[0]
-                note = f"routed by Comment '{visit.comment}' ({', '.join(homes)})"
-            else:
-                changes.append(EmployeeChange(
-                    sheet=" / ".join(homes),
-                    action=EMP_ACTION_MISMATCH,
-                    patient=visit.patient,
-                    session_date=visit.date_str,
-                    insurance=visit.insurance,
-                    copay=visit.copay,
-                    payment=visit.payment,
+            conflict = _practitioner_conflict(match, sheet.name)
+            if conflict:
+                changes.append(_change_from(
+                    match, sheet, EMP_ACTION_MISMATCH,
+                    row_num=row.row_num, fills=fills,
                     note=(
-                        f"Patient appears in {len(homes)} tabs ({', '.join(homes)}) "
-                        "and the Comment does not resolve it"
+                        f"EOB was billed under {conflict}'s NPI {match.npi}, "
+                        f"but this is the {sheet.name} tab"
                     ),
                     accepted=False,
                 ))
                 continue
 
-        if target not in EMPLOYEE_APPEND_SHEETS:
-            changes.append(EmployeeChange(
-                sheet=target,
-                action=EMP_ACTION_UNASSIGNED,
-                patient=visit.patient,
-                session_date=visit.date_str,
-                insurance=visit.insurance,
-                copay=visit.copay,
-                payment=visit.payment,
-                note=f"{target} does not accept appends; add this session by hand",
-                accepted=False,
-            ))
-            continue
+            if match.review_note:
+                changes.append(_change_from(
+                    match, sheet, EMP_ACTION_AMBIGUOUS,
+                    row_num=row.row_num, fills=fills,
+                    note=match.review_note, accepted=False,
+                ))
+                continue
 
-        sheet = sheets[target]
-        if _comment_conflict(visit, target):
-            note = f"Schedule Comment says '{visit.comment}', but appending to {target}"
-            changes.append(EmployeeChange(
-                sheet=target,
-                action=EMP_ACTION_MISMATCH,
-                patient=visit.patient,
-                session_date=visit.date_str,
-                insurance=visit.insurance,
-                copay=visit.copay,
-                payment=visit.payment,
-                payment_column=EMPLOYEE_PAYMENT_COLUMN.get(target, ""),
-                note=note,
-                accepted=False,
+            changes.append(_change_from(
+                match, sheet, EMP_ACTION_FILL if fills else EMP_ACTION_NOTHING,
+                row_num=row.row_num, fills=fills, accepted=bool(fills),
             ))
-            continue
 
-        changes.append(EmployeeChange(
-            sheet=target,
-            action=EMP_ACTION_APPEND,
-            patient=visit.patient,
-            session_date=visit.date_str,
-            insurance=visit.insurance,
-            copay=visit.copay,
-            payment=visit.payment,
-            payment_column=EMPLOYEE_PAYMENT_COLUMN.get(target, ""),
-            fills=_append_values(sheet, visit),
-            note=note,
-            accepted=True,
-        ))
+    # 2. Append NPI-matched visits the tab does not have yet. Only tabs whose
+    #    associate bills under her own NPI take appends; Marcia never does.
+    for name in EMPLOYEE_SHEETS:
+        sheet = sheets.get(name)
+        if sheet is None or name not in EMPLOYEE_APPEND_SHEETS:
+            continue
+        own = str(EMPLOYEE_NPI[name])
+        for visit in visits:
+            if visit.npi != own:
+                continue
+            placed.add(visit.key)
+            if sheet.has_session(visit.patient, visit.session_date):
+                continue  # already in the tab -- dedup, so re-runs add nothing
+            changes.append(_change_from(
+                visit, sheet, EMP_ACTION_APPEND,
+                fills=_append_values(sheet, visit),
+                note=visit.review_note,
+                accepted=not visit.review_note,
+            ))
+
+    # 3. Everything else: shown, never guessed at.
+    for visit in visits:
+        if visit.key not in placed:
+            changes.append(_unassigned(visit, sheets))
 
     for change in changes:
         change.processed_on = stamp
-        change.check_eft = _eft_for(change, visits)
 
     return changes
 
 
-def _eft_for(change: EmployeeChange, visits: Sequence[ScheduleVisit]) -> str:
-    """The paying remit's EFT for the schedule visit behind this change."""
-    for visit in visits:
-        if (visit.date_str == change.session_date
-                and _same_person(change.patient, visit.patient)):
-            return visit.check_eft
-    return ""
+def _unassigned(visit: EobVisit, sheets: dict[str, EmployeeSheet]) -> EmployeeChange:
+    """A visit no tab can claim: listed for manual placement, never guessed.
 
-
-def _key_of(patient: str):
-    from .matching import split_name
-
-    return split_name(patient)
-
-
-def _unassigned(visit: ScheduleVisit, sheets: dict[str, EmployeeSheet]) -> EmployeeChange:
-    """A patient in no tab: listed, never guessed at."""
-    if FALLBACK_TO_COMMENT_FOR_NEW and visit.comment:
-        target = next(
-            (name for name in sheets if _normalize_token(name) == _normalize_token(visit.comment)),
-            None,
+    Most visits bill under the supervising physician's NPI (incident-to), so
+    this is the *ordinary* outcome for that physician's own direct patients,
+    and for every Marcia session with no row already waiting for it. Nothing
+    is written either way.
+    """
+    homes = [name for name, sheet in sheets.items() if sheet.has_patient(visit.patient)]
+    if homes:
+        fill_only = all(name not in EMPLOYEE_APPEND_SHEETS for name in homes)
+        note = (
+            f"{' / '.join(homes)} already has this patient, but the EOB's NPI "
+            f"{visit.npi} is not that tab's provider"
+            + (" (fill-only tab)" if fill_only else "")
+            + " - add this session by hand"
         )
-        if target and target in EMPLOYEE_APPEND_SHEETS:
-            sheet = sheets[target]
-            return EmployeeChange(
-                sheet=target,
-                action=EMP_ACTION_APPEND,
-                patient=visit.patient,
-                session_date=visit.date_str,
-                insurance=visit.insurance,
-                copay=visit.copay,
-                payment=visit.payment,
-                payment_column=EMPLOYEE_PAYMENT_COLUMN.get(target, ""),
-                fills=_append_values(sheet, visit),
-                note=f"new patient routed by Comment '{visit.comment}'",
-                accepted=True,
-            )
+    else:
+        note = "Patient is not in any provider tab - place this session by hand"
 
-    # Optional overflow bucket, OFF by default.
-    #
-    # WARNING: most visits bill under the supervising physician's NPI
-    # (incident-to), so a large share of "no tab" patients are that
-    # physician's OWN direct patients, who legitimately belong in no
-    # associate's tab. Turning this on sweeps every one of them into the
-    # catch-all tab. It is always flagged for review, never applied silently.
-    catch_all = sheets.get(EMPLOYEE_CATCH_ALL_SHEET)
-    if MARCIA_CATCH_ALL_UNASSIGNED and catch_all is not None:
-        return EmployeeChange(
-            sheet=catch_all.name,
-            action=EMP_ACTION_AUTO_PLACED,
-            patient=visit.patient,
-            session_date=visit.date_str,
-            insurance=visit.insurance,
-            copay=visit.copay,
-            payment=visit.payment,
-            payment_column=EMPLOYEE_PAYMENT_COLUMN.get(catch_all.name, ""),
-            fills=_append_values(catch_all, visit),
-            note=(
-                f"Patient is in no provider tab; auto-placed in "
-                f"{catch_all.name} by MARCIA_CATCH_ALL_UNASSIGNED - verify, "
-                "they may be the physician's own direct patient"
-            ),
-            accepted=False,
-        )
+    if visit.review_note:
+        note = f"{visit.review_note}; {note}"
 
     return EmployeeChange(
         sheet="",
@@ -648,12 +591,14 @@ def _unassigned(visit: ScheduleVisit, sheets: dict[str, EmployeeSheet]) -> Emplo
         insurance=visit.insurance,
         copay=visit.copay,
         payment=visit.payment,
-        note="Patient is not in any provider tab - place this session by hand",
+        npi=visit.npi,
+        check_eft=visit.check_eft,
+        note=note,
         accepted=False,
     )
 
 
-def _append_values(sheet: EmployeeSheet, visit: ScheduleVisit) -> dict[int, Any]:
+def _append_values(sheet: EmployeeSheet, visit: EobVisit) -> dict[int, Any]:
     """Every mapped column for a brand-new row, as {column index: value}."""
     values: dict[int, Any] = {}
     for column, value in (
@@ -830,5 +775,6 @@ def summarize_employees(changes: Sequence[EmployeeChange]) -> dict[str, int]:
         "append": sum(1 for c in changes if c.action == EMP_ACTION_APPEND),
         "no_match": sum(1 for c in changes if c.action == EMP_ACTION_NO_MATCH),
         "mismatch": sum(1 for c in changes if c.action == EMP_ACTION_MISMATCH),
+        "ambiguous": sum(1 for c in changes if c.action == EMP_ACTION_AMBIGUOUS),
         "unassigned": sum(1 for c in changes if c.action == EMP_ACTION_UNASSIGNED),
     }

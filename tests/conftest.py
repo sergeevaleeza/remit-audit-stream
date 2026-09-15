@@ -15,13 +15,43 @@ from remit.pdf_parser import Visit, parse_remittances
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REMIT_PDF = FIXTURES / "RemitDoc-0000000001.PDF"
+ASSOCIATES_PDF = FIXTURES / "RemitDoc-0000000004.PDF"
 SCHEDULE_XLSX = FIXTURES / "List_of_Patients_Schedule.xlsx"
+EMPLOYEES_XLSX = FIXTURES / "AMSMC_employees_sample.xlsx"
 
 
 @pytest.fixture(scope="session")
 def remit_parse():
     """(documents, visits) parsed once from the sample remittance."""
     return parse_remittances([(str(REMIT_PDF), REMIT_PDF.name)])
+
+
+@pytest.fixture(scope="session")
+def all_visits():
+    """Every reconciled visit, including the associate-NPI remittance.
+
+    The employees workbook gates appends on the performing-provider NPI, and
+    `RemitDoc-0000000001.PDF` bills entirely under one physician, so the
+    employees tests need `RemitDoc-0000000004.PDF` alongside it to have more
+    than one provider in play.
+    """
+    return parse_remittances([
+        (str(REMIT_PDF), REMIT_PDF.name),
+        (str(ASSOCIATES_PDF), ASSOCIATES_PDF.name),
+    ])[1]
+
+
+@pytest.fixture()
+def employees_bytes() -> bytes:
+    return EMPLOYEES_XLSX.read_bytes()
+
+
+@pytest.fixture()
+def employee_sheets(employees_bytes):
+    """The provider tabs of a fresh copy of the synthetic employees workbook."""
+    from remit.employees import load_employees_workbook, read_sheets
+
+    return read_sheets(load_employees_workbook(employees_bytes))
 
 
 @pytest.fixture(scope="session")
