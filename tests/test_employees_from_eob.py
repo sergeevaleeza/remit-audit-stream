@@ -1,17 +1,15 @@
-"""The employees file is sourced from the EOBs, and the service-date cutoff.
+"""The employees file is populated from the EOBs, not from the schedule.
 
-Two changes are covered here.
+The employees tabs are filled directly from the reconciled EOB visits, rather
+than by reading values back out of the updated schedule. The schedule and the
+employees workbook are independent consumers of one visit set.
 
-* **The employees tabs are populated directly from the reconciled EOB
-  visits**, not by reading values back out of the updated schedule. The
-  schedule and the employees workbook are independent consumers of one visit
-  set. Appends are gated on the EOB's **PERF PROV NPI**: a visit reaches Ana's
-  or Oxana's tab only if she performed it. Marcia is fill-only, because her
-  sessions bill incident-to under the supervising physician and the remit can
-  never prove one is hers.
-* **An optional service-date cutoff** drops visits served before a date, for
-  the whole run, so re-processing a remit the providers have already archived
-  cannot re-append rows they finished with by hand.
+Appends are gated on the EOB's **PERF PROV NPI**: a visit reaches Ana's or
+Oxana's tab only if she performed it. Marcia is fill-only, because her sessions
+bill incident-to under the supervising physician and the remit can never prove
+one is hers.
+
+The EOB-date cutoff that scopes a whole run lives in `test_eob_cutoff.py`.
 
 Every patient here is fictional (see `tests/fixtures/README.md`).
 """
@@ -48,7 +46,7 @@ from remit.excel_updater import (
     read_schedule_rows,
     resolve_columns,
 )
-from remit.matching import apply_service_date_cutoff, build_plan, cutoff_label
+from remit.matching import build_plan
 
 from .conftest import sheet_rows
 from .fixtures.synthetic_remit_data import (
@@ -373,90 +371,6 @@ def test_a_duplicate_only_visit_is_never_recorded_silently(employee_sheets):
     changes = plan_employee_changes(employee_sheets, duplicate_only, today=STAMP)
     assert changes
     assert not [c for c in changes if c.accepted]
-
-
-# --- The service-date cutoff ------------------------------------------------
-
-def test_no_cutoff_processes_everything(all_visits):
-    assert apply_service_date_cutoff(all_visits, None) == list(all_visits)
-
-
-def test_a_visit_before_the_cutoff_is_dropped(all_visits):
-    kept = apply_service_date_cutoff(all_visits, date(2026, 6, 1))
-    assert kept
-    assert all(v.service_date >= date(2026, 6, 1) for v in kept)
-    assert not [v for v in kept if v.service_date == date(2025, 12, 25)]
-
-
-def test_the_cutoff_date_itself_is_kept(all_visits):
-    """Inclusive: a visit served exactly on the cutoff stays in the run."""
-    kept = apply_service_date_cutoff(all_visits, date(2026, 6, 2))
-    assert [v for v in kept if v.service_date == date(2026, 6, 2)]
-
-
-def test_the_cutoff_drops_the_visit_from_the_schedule_too(schedule_bytes, all_visits):
-    """Scope is the whole run, so the two consumers cannot disagree."""
-    worksheet = get_schedule_sheet(load_schedule_workbook(schedule_bytes))
-    rows = read_schedule_rows(worksheet, resolve_columns(worksheet))
-
-    kept = apply_service_date_cutoff(all_visits, date(2026, 4, 1))
-    plan = build_plan(kept, rows, today=STAMP)
-    planned = {c.visit.service_date for c in plan}
-    assert planned
-    assert min(planned) >= date(2026, 4, 1)
-
-    # `Castellano` 03/26 is a Fill without the cutoff, and absent with it.
-    without = build_plan(all_visits, rows, today=STAMP)
-    assert [c for c in without if c.visit.service_date == date(2026, 3, 26)]
-    assert not [c for c in plan if c.visit.service_date == date(2026, 3, 26)]
-
-
-def test_the_cutoff_drops_the_visit_from_the_employees_file_too(
-        employee_sheets, all_visits):
-    kept = apply_service_date_cutoff(all_visits, date(2026, 6, 1))
-    changes = plan_employee_changes(employee_sheets, eob_visits(kept), today=STAMP)
-
-    # Castellano 03/26 fills Ana's tab without a cutoff; with one it is gone.
-    assert not [c for c in changes
-                if c.session_date == "03/26/2026" and c.action == EMP_ACTION_FILL]
-    # ...and the June rows still work.
-    assert change_for(changes, "Ravensworth", "06/16/2026",
-                      sheet="Ana").action == EMP_ACTION_APPEND
-
-
-def test_a_cutoff_row_with_no_eob_is_reported_not_filled(employee_sheets, all_visits):
-    """A pre-cutoff tab row simply has no match; nothing is written to it."""
-    from remit.config import EMP_ACTION_NO_MATCH
-
-    kept = apply_service_date_cutoff(all_visits, date(2026, 6, 1))
-    changes = plan_employee_changes(employee_sheets, eob_visits(kept), today=STAMP)
-    change = change_for(changes, "Castellano", "03/26/2026", sheet="Ana")
-    assert change.action == EMP_ACTION_NO_MATCH
-    assert not change.accepted
-
-
-def test_the_cutoff_never_writes_what_it_dropped(employees_bytes, employee_sheets,
-                                                 all_visits):
-    kept = apply_service_date_cutoff(all_visits, date(2026, 6, 1))
-    changes = plan_employee_changes(employee_sheets, eob_visits(kept), today=STAMP)
-    updated, _ = build_updated_employees(employees_bytes, changes)
-    row = next(r for r in tab_rows(load_employees_workbook(updated.getvalue()), "Ana")
-               if r["Date of Session"] == "03/26/2026")
-    assert row["Paid by Ins toAna"] is None
-
-
-def test_cutoff_label_reads_as_the_preview_shows_it():
-    assert cutoff_label(None) == "no cutoff - all service dates processed"
-    assert cutoff_label(date(2026, 7, 1)) == "cutoff: on/after 07/01/2026"
-
-
-def test_an_empty_cutoff_is_the_default_everywhere(all_visits, employee_sheets):
-    """Data is never dropped unless the user asks for it."""
-    unfiltered = apply_service_date_cutoff(all_visits, None)
-    assert len(unfiltered) == len(all_visits)
-    changes = plan_employee_changes(employee_sheets, eob_visits(unfiltered),
-                                    today=STAMP)
-    assert [c for c in changes if c.session_date == "12/25/2025"]
 
 
 # --- Idempotency and never-overwrite ----------------------------------------

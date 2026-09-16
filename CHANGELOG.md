@@ -8,8 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 The employees workbook is now populated **directly from the reconciled EOB
 visits** instead of by reading values back out of the updated schedule, and
 appending a session to a provider tab is gated on the EOB's performing-provider
-NPI. Adds an optional service-date cutoff for the whole run. 427 tests pass
-(was 381). The Mutual workbook remains a read-only DX source and is never
+NPI. Adds an optional EOB-date cutoff that skips whole remittances. 439 tests
+pass (was 381). The Mutual workbook remains a read-only DX source and is never
 modified.
 
 ### Changed — the employees file is sourced from the EOBs, not the schedule
@@ -98,24 +98,42 @@ synthetic placeholder in `remit/config.py`; real values go in
 A tab omitted from the mapping is fill-only. That is the safe default: the app
 can then only ever fail to add a row, never add somebody else's.
 
-### Added — optional service-date cutoff
+### Added — optional EOB-date cutoff
 
-A new **Ignore visits before (service date)** input, **empty by default**.
+A new **Ignore EOBs dated before** input, **empty by default**.
 
-- When set, every reconciled visit served **before** the date is dropped.
-  **Inclusive**: a visit dated exactly on the cutoff is kept.
-- **Scope is the whole run** — the drop happens on the reconciled visit set
-  *before* either the schedule or the employees file sees it, so the two
-  outputs can never disagree about what was in scope.
-- Empty means no cutoff and everything is processed. Data is never dropped
-  unless the user asks for it.
-- The active cutoff appears in the page and in the employees preview
-  (*cutoff: on/after 07/01/2026*), and is part of the upload signature, so
-  changing it re-plans rather than reusing a cached plan.
+**The unit is the whole remittance, and the date compared is the remit's own
+header `DATE:`** — the EOB/check date — *not* the service date.
 
-Its purpose is re-processing: providers archive older sessions and reconcile
-them by hand, and re-uploading a remit covering them would otherwise re-append
-rows they have finished with.
+- When set, an uploaded remit dated before the cutoff is **skipped entirely**
+  and none of its visits enter the run. **Inclusive**: a remit dated exactly
+  on the cutoff is processed, and every visit inside it is kept however old
+  the session.
+- The exclusion happens **at parse time, before reconciliation**
+  (`parse_remittances(..., eob_cutoff=…)` filters ahead of `aggregate_visits`).
+  A skipped remit therefore contributes no visits *and* no reconciliation
+  occurrence, so it can neither restate an amount nor mark another remit's
+  visit as a duplicate from outside the run.
+- **Scope is the whole run** — one filter, applied once, ahead of both the
+  schedule and the employees file, so the two outputs cannot disagree about
+  what was in scope.
+- Empty means no cutoff and every uploaded remit is processed. Data is never
+  dropped unless the user asks for it.
+- The active cutoff (*cutoff: EOBs on/after 07/01/2026*) and the name and EFT
+  of **every remit it skipped** are shown in the page; the parsed-files table
+  gains an *In this run* column. A cutoff that excludes everything says so,
+  rather than reporting "nothing to apply" as if the work were done.
+- A remit whose header `DATE:` cannot be read is **processed rather than
+  dropped**, and flagged — losing payments silently is the worse failure.
+- The cutoff is part of the upload signature, so changing it re-plans rather
+  than reusing a cached plan.
+
+Why the remit date rather than the service date: a remit settles claims long
+after the fact — the sample paying remittance is dated 07/20/2026 and pays
+sessions back to 01/15/2026. Filtering by service date would tear such a remit
+in half and drop payments the user is actively reconciling. Filtering by the
+EOB's own date lets a clinic archive by batch: *"everything up to the June
+check is reconciled, start from July."*
 
 ### Added — preview
 
@@ -129,11 +147,16 @@ rows they have finished with.
 
 ### Added — tests and fixtures
 
-- `tests/test_employees_from_eob.py` (43 tests): the EOB is the source and a
+- `tests/test_employees_from_eob.py` (34 tests): the EOB is the source and a
   differing schedule value cannot reach the tabs; NPI-gated appends including
-  the negative cases; Marcia never appends; the cutoff in both directions and
-  on both consumers; OA-18 duplicates still not zeroing employee values;
-  idempotent re-runs.
+  the negative cases; Marcia never appends; OA-18 duplicates still not zeroing
+  employee values; idempotent re-runs.
+- `tests/test_eob_cutoff.py` (20 tests): the cutoff reads the header `DATE:`,
+  a skipped remit's *recent* service dates go with it while an included
+  remit's *ancient* ones stay, an undated remit is kept, both consumers see
+  one visit set — and, the sharpest case, skipping the paying remit leaves its
+  OA-18 duplicate orphaned as *duplicate only*, which can only happen if the
+  excluded remit contributed no reconciliation occurrence at all.
 - `tests/fixtures/RemitDoc-0000000004.PDF` and `make_associates_fixture.py`:
   a fourth synthetic remittance carrying **three different performing-provider
   NPIs**. The existing fixtures each bill under a single NPI, which cannot
@@ -146,8 +169,11 @@ rows they have finished with.
 
 - `remit/config.py`'s local-file and Streamlit-secrets loaders are generalised
   (`_load_local_map`, `_load_secrets_map`) and shared by both mappings.
-- `apply_service_date_cutoff()` and `cutoff_label()` live in `remit/matching.py`
-  and operate on the reconciled visit list.
+- `split_by_eob_cutoff()` and `cutoff_label()` live in `remit/pdf_parser.py`,
+  alongside the `RemitDocument` whose header date they read. `parse_remittances`
+  takes an optional `eob_cutoff` and still returns **every** parsed document,
+  so the UI can report what it left out, while aggregating only the remits in
+  scope.
 
 ## [1.6.0] — 2026-09-10
 

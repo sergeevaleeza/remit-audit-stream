@@ -283,34 +283,6 @@ def is_blank(value: Any) -> bool:
     return False
 
 
-# --- Service-date cutoff ---------------------------------------------------
-
-def apply_service_date_cutoff(visits: Iterable[Visit],
-                              cutoff: date | None) -> list[Visit]:
-    """Drop reconciled visits served **before** `cutoff`; keep the rest.
-
-    Applied once, to the reconciled visit set, before either consumer -- the
-    schedule or the employees workbook -- sees it, so the two can never
-    disagree about which visits are in scope. Providers archive older
-    sessions, and re-processing an archived remit re-appends rows they have
-    already reconciled by hand; a cutoff is how the user says "start here".
-
-    **Inclusive**: a visit served exactly on the cutoff is kept. ``None``
-    (the default in the UI) keeps everything -- data is never dropped unless
-    the user asks for it.
-    """
-    if cutoff is None:
-        return list(visits)
-    return [visit for visit in visits if visit.service_date >= cutoff]
-
-
-def cutoff_label(cutoff: date | None) -> str:
-    """The preview's description of the active cutoff."""
-    if cutoff is None:
-        return "no cutoff - all service dates processed"
-    return f"cutoff: on/after {cutoff.strftime(DATE_FMT)}"
-
-
 # --- Schedule rows ---------------------------------------------------------
 
 @dataclass

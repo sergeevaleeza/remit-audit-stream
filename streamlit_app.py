@@ -41,13 +41,7 @@ from remit.excel_updater import (
     read_schedule_rows,
     resolve_columns,
 )
-from remit.matching import (
-    apply_service_date_cutoff,
-    build_plan,
-    cutoff_label,
-    find_legacy_duplicate_rows,
-    summarize,
-)
+from remit.matching import build_plan, find_legacy_duplicate_rows, summarize
 from remit.employees import (
     EmployeesError,
     build_updated_employees,
@@ -59,7 +53,7 @@ from remit.employees import (
     summarize_employees,
 )
 from remit.mutual import load_dx_lookup
-from remit.pdf_parser import parse_remittances
+from remit.pdf_parser import cutoff_label, parse_remittances, split_by_eob_cutoff
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -88,7 +82,7 @@ def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]
                      cutoff: date | None = None) -> str:
     """Stable id for one run, so parsing only reruns when something changes.
 
-    The cutoff is part of it: changing the date changes which visits the run
+    The cutoff is part of it: changing the date changes which remits the run
     sees, so the plan has to be rebuilt even though the uploads are the same.
     """
     digest = hashlib.sha256(schedule_bytes)
@@ -304,7 +298,7 @@ with st.sidebar:
 1. Upload `List_of_Patients_Schedule.xlsx`
 2. Upload one or more remittance PDFs
 3. Optionally upload `List_of_Patients_Mutual.xlsx` for DX codes
-4. Optionally set **Ignore visits before** to skip archived service dates
+4. Optionally set **Ignore EOBs dated before** to skip archived remits
 5. Review every proposed change
 6. Confirm and download the updated copy
 
@@ -370,17 +364,21 @@ with far_right:
     )
 
 cutoff = st.date_input(
-    "Ignore visits before (service date)",
+    "Ignore EOBs dated before",
     value=None,
     format="MM/DD/YYYY",
-    help="Optional. Drops every remittance visit served BEFORE this date, for "
-         "both the schedule and the employees file. Inclusive — a visit on the "
-         "date itself is kept. Leave empty to process everything.",
+    help="Optional. Skips a whole uploaded remittance whose header DATE: is "
+         "BEFORE this date, for both the schedule and the employees file. This "
+         "is the EOB/check date, NOT the service date — a remit that is kept "
+         "keeps every visit in it, however old the session. Inclusive: a remit "
+         "dated on the day itself is processed. Leave empty to process all.",
 )
 st.caption(
-    f"Service-date filter: **{cutoff_label(cutoff)}**. Use it to skip periods the "
-    "providers have already archived and reconciled by hand, so re-uploading an "
-    "old remit cannot re-append rows they have finished with."
+    f"EOB-date filter: **{cutoff_label(cutoff)}**. Use it to skip remittance "
+    "batches the providers have already archived and reconciled by hand, so "
+    "re-uploading an old remit cannot re-apply work they have finished with. "
+    "It filters by the remit's own `DATE:`, so a July EOB paying a January "
+    "session is either kept whole or skipped whole."
 )
 
 if not schedule_upload or not pdf_uploads:
@@ -413,18 +411,20 @@ if st.session_state.get("signature") != signature:
 
     with st.spinner("Parsing remittance PDFs…"):
         try:
-            documents, parsed_visits = parse_remittances(
-                [(io.BytesIO(payload), name) for payload, name in pdf_payloads]
+            # Whole remits dated before the cutoff are excluded here, before
+            # aggregation, so a skipped one contributes neither visits nor a
+            # reconciliation occurrence. One filter, ahead of both consumers,
+            # so the schedule and the employees file cannot disagree on scope.
+            documents, visits = parse_remittances(
+                [(io.BytesIO(payload), name) for payload, name in pdf_payloads],
+                eob_cutoff=cutoff,
             )
         except Exception as error:  # noqa: BLE001
             safe_error("Could not parse the PDFs", error)
             st.stop()
 
-    # One cutoff, applied to the reconciled visit set before either consumer
-    # sees it, so the schedule and the employees file can never disagree about
-    # which visits are in scope.
-    visits = apply_service_date_cutoff(parsed_visits, cutoff)
-    dropped = len(parsed_visits) - len(visits)
+    processed_docs, skipped_docs = split_by_eob_cutoff(documents, cutoff)
+    undated = [doc for doc in processed_docs if doc.billed_date is None]
 
     dx_lookup = None
     if mutual_bytes:
@@ -466,7 +466,9 @@ if st.session_state.get("signature") != signature:
         documents=documents,
         plan=plan,
         employee_changes=employee_changes,
-        dropped_by_cutoff=dropped,
+        skipped_remits=[(d.filename, d.check_eft) for d in skipped_docs],
+        processed_remits=[d.filename for d in processed_docs],
+        undated_remits=[d.filename for d in undated],
         schedule_row_count=len(rows),
         schedule_rows=rows,
         dx_entry_count=len(dx_lookup) if dx_lookup else 0,
@@ -478,22 +480,37 @@ if st.session_state.get("signature") != signature:
 documents = st.session_state["documents"]
 plan = st.session_state["plan"]
 employee_changes = st.session_state.get("employee_changes") or []
+skipped_remits = st.session_state.get("skipped_remits") or []
+processed_remits = set(st.session_state.get("processed_remits") or [])
+undated_remits = st.session_state.get("undated_remits") or []
 
 dx_entry_count = st.session_state.get("dx_entry_count", 0)
 st.success(
     f"Read {st.session_state['schedule_row_count']} schedule rows from "
-    f"`{SHEET_NAME}` and {sum(d.claim_count for d in documents)} claims "
-    f"from {len(documents)} PDF(s)."
+    f"`{SHEET_NAME}` and "
+    f"{sum(d.claim_count for d in documents if d.filename in processed_remits)} "
+    f"claims from {len(processed_remits)} of {len(documents)} PDF(s)."
     + (f" DX reference loaded: {dx_entry_count} patient(s)." if dx_entry_count
        else " No DX reference uploaded — DX will be left blank.")
 )
 
-dropped_by_cutoff = st.session_state.get("dropped_by_cutoff", 0)
-if dropped_by_cutoff:
+if skipped_remits:
+    listed = ", ".join(
+        f"{name} (EFT {eft})" if eft else name for name, eft in skipped_remits
+    )
     st.info(
-        f"Service-date cutoff **{cutoff.strftime('%m/%d/%Y')}** — "
-        f"{dropped_by_cutoff} parsed visit(s) served before it were dropped from "
-        "this run, for both the schedule and the employees file."
+        f"EOB-date cutoff **{cutoff.strftime('%m/%d/%Y')}** — "
+        f"{len(skipped_remits)} of {len(documents)} uploaded remit(s) are dated "
+        f"before it and were skipped whole, for both the schedule and the "
+        f"employees file: {listed}. Every visit in them is excluded, however "
+        "recent the service date."
+    )
+
+if undated_remits and cutoff:
+    st.warning(
+        f"{len(undated_remits)} uploaded remit(s) have no readable header "
+        f"`DATE:` ({', '.join(undated_remits)}), so the cutoff cannot place "
+        "them. They are **processed** rather than dropped — check them."
     )
 
 dx_conflicts = st.session_state.get("dx_conflicts") or {}
@@ -514,6 +531,8 @@ with st.expander("Parsed remittance files", expanded=False):
                     "File": doc.filename,
                     "Billed date (header DATE:)": doc.billed_date.strftime("%m/%d/%Y")
                     if doc.billed_date else "—",
+                    "In this run": "yes" if doc.filename in processed_remits
+                    else "skipped (before cutoff)",
                     "CHECK/EFT #": doc.check_eft or "—",
                     "Claims": doc.claim_count,
                     "Service lines": len(doc.service_lines),
@@ -526,7 +545,8 @@ with st.expander("Parsed remittance files", expanded=False):
         use_container_width=True,
     )
 
-warn_on_duplicate_checks(documents)
+# A skipped remit is not in this run, so it cannot be a duplicate upload of one.
+warn_on_duplicate_checks([d for d in documents if d.filename in processed_remits])
 
 
 # --- Preview ---------------------------------------------------------------
@@ -547,7 +567,19 @@ show_skipped = st.checkbox(
 visible = plan if show_skipped else actionable
 
 if not visible:
-    st.info("Nothing to apply — every parsed visit is already recorded in the schedule.")
+    if not plan and skipped_remits:
+        # Distinguish "all caught up" from "the cutoff excluded the lot",
+        # which otherwise look identical and mean very different things.
+        st.warning(
+            f"Nothing to apply — this run has no visits in it. The EOB-date "
+            f"cutoff skipped {len(skipped_remits)} of {len(documents)} "
+            "uploaded remit(s); clear it or move it back to include them."
+        )
+    else:
+        st.info(
+            "Nothing to apply — every parsed visit is already recorded in the "
+            "schedule."
+        )
     st.stop()
 
 st.caption(

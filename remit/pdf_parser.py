@@ -554,7 +554,59 @@ def _reconcile(group: list[Visit]) -> Visit:
     return winner
 
 
-def parse_remittances(files: Sequence[tuple[object, str]]) -> tuple[list[RemitDocument], list[Visit]]:
-    """Parse several (file_obj, filename) pairs and aggregate across all of them."""
+# --- EOB-date cutoff --------------------------------------------------------
+
+def split_by_eob_cutoff(documents: Sequence[RemitDocument],
+                        cutoff: date | None) -> tuple[list[RemitDocument],
+                                                      list[RemitDocument]]:
+    """``(processed, skipped)``, split on each remit's header ``DATE:``.
+
+    The unit is the **whole remittance**, not the visit. A remit pays claims
+    long after the fact -- a July EOB routinely settles a January session --
+    so filtering by service date would tear a remit in half and drop payments
+    the user is actually reconciling. Filtering by the EOB's own date instead
+    lets a clinic archive by remit batch: "everything up to the June check is
+    done, start from July".
+
+    **Inclusive**: a remit dated exactly on the cutoff is processed, and every
+    visit inside it is kept however old its service date.
+
+    A remit whose header ``DATE:`` could not be parsed is **kept**. It cannot
+    be placed on either side of the cutoff, and silently discarding payments
+    is the worse of the two failures; the caller surfaces it instead.
+    """
+    if cutoff is None:
+        return list(documents), []
+
+    processed: list[RemitDocument] = []
+    skipped: list[RemitDocument] = []
+    for document in documents:
+        if document.billed_date is None or document.billed_date >= cutoff:
+            processed.append(document)
+        else:
+            skipped.append(document)
+    return processed, skipped
+
+
+def cutoff_label(cutoff: date | None) -> str:
+    """The preview's description of the active cutoff."""
+    if cutoff is None:
+        return "no cutoff - every uploaded remit processed"
+    return f"cutoff: EOBs on/after {cutoff.strftime(DATE_FMT)}"
+
+
+def parse_remittances(files: Sequence[tuple[object, str]],
+                      eob_cutoff: date | None = None) -> tuple[list[RemitDocument],
+                                                               list[Visit]]:
+    """Parse several (file_obj, filename) pairs and aggregate across them.
+
+    The returned ``documents`` list is **every** file parsed, so the caller can
+    show what it left out; ``visits`` is aggregated only from the remits on or
+    after ``eob_cutoff``. Excluding them here -- before `aggregate_visits` --
+    is what makes the cutoff honest: a skipped remit contributes no visits
+    *and* no reconciliation occurrence, so it cannot restate an amount or mark
+    another remit's visit as a duplicate from outside the run.
+    """
     documents = [parse_document(obj, name) for obj, name in files]
-    return documents, aggregate_visits(documents)
+    processed, _ = split_by_eob_cutoff(documents, eob_cutoff)
+    return documents, aggregate_visits(processed)

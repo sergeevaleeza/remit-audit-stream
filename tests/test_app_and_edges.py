@@ -286,9 +286,19 @@ def test_the_cutoff_input_defaults_to_empty():
     assert not app.exception, [str(e) for e in app.exception]
 
     cutoff = next(w for w in app.date_input
-                  if "Ignore visits before" in w.label)
+                  if "Ignore EOBs dated before" in w.label)
     assert cutoff.value is None
     assert any("no cutoff" in str(c.value) for c in app.caption)
+
+
+def test_the_cutoff_input_says_it_reads_the_eob_date():
+    """The label must not be mistaken for a service-date filter."""
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_file("streamlit_app.py", default_timeout=60).run()
+    cutoff = next(w for w in app.date_input
+                  if "Ignore EOBs dated before" in w.label)
+    assert "NOT the service date" in cutoff.help
 
 
 def test_setting_the_cutoff_is_reflected_in_the_page():
@@ -296,8 +306,9 @@ def test_setting_the_cutoff_is_reflected_in_the_page():
     from streamlit.testing.v1 import AppTest
 
     app = AppTest.from_file("streamlit_app.py", default_timeout=60).run()
-    cutoff = next(w for w in app.date_input if "Ignore visits before" in w.label)
+    cutoff = next(w for w in app.date_input
+                  if "Ignore EOBs dated before" in w.label)
 
     app = cutoff.set_value(date(2026, 7, 1)).run()
     assert not app.exception, [str(e) for e in app.exception]
-    assert any("on/after 07/01/2026" in str(c.value) for c in app.caption)
+    assert any("EOBs on/after 07/01/2026" in str(c.value) for c in app.caption)

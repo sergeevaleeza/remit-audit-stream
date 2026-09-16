@@ -39,10 +39,12 @@ needs the result to be auditable rather than fast.
   are only *added* to a tab when the EOB's performing-provider NPI says that
   associate did the work; Marcia's tab is fill-only. Also optional — without it
   nothing changes.
-- **Optional service-date cutoff.** Set *Ignore visits before* to drop visits
-  served earlier than a date from the whole run, so re-processing a remit that
-  covers already-archived sessions cannot re-add them. Empty by default, and
-  inclusive of the date itself.
+- **Optional EOB-date cutoff.** Set *Ignore EOBs dated before* to skip whole
+  uploaded remittances dated earlier than a date, so re-processing an
+  already-archived batch cannot re-apply it. It reads the remit's header
+  `DATE:`, **not** the service date — a July EOB paying a January session is
+  kept or skipped as one unit. Empty by default, and inclusive of the date
+  itself.
 - **Telehealth is called out.** `Ins` is derived per visit from the remit's
   place of service: `POS 10(95)` for a telehealth encounter, `Medicare`
   otherwise.
@@ -289,21 +291,35 @@ actually writes to, and are reused rather than duplicated on later runs.
 
 Dedup is by patient + Date of Session, so re-running adds nothing.
 
-### Service-date cutoff
+### EOB-date cutoff
 
-An optional **Ignore visits before (service date)** input, **empty by
-default**. When set, every remittance visit served *before* that date is
-dropped from the run; a visit dated exactly **on** the cutoff is kept.
+An optional **Ignore EOBs dated before** input, **empty by default**.
 
-The drop happens once, on the reconciled visit set, **before either the
-schedule or the employees file sees it** — so the two outputs can never
-disagree about what was in scope. Its purpose is re-processing: providers
-archive older sessions and reconcile them by hand, and re-uploading a remit
-that covers them would otherwise re-append rows they have already finished
-with. Leaving it empty processes everything, exactly as before; data is never
-dropped unless you ask for it.
+**The unit is the whole remittance, and the date compared is the remit's own
+header `DATE:`** — the EOB/check date — never the service date. When set, an
+uploaded remit dated before the cutoff is skipped entirely and none of its
+visits enter the run. A remit dated exactly **on** the cutoff is processed,
+and everything inside it is kept however old the session.
 
-The active cutoff is shown in the preview and in the employees section.
+That distinction is the point. A remit settles claims long after the fact: the
+sample paying remittance is dated 07/20/2026 and pays sessions going back to
+01/15/2026. Filtering by *service* date would tear such a remit in half and
+drop payments you are actively reconciling. Filtering by the EOB's own date
+lets you archive by batch instead — *"everything up to the June check is done,
+start from July."*
+
+The exclusion happens **at parse time, before reconciliation**, which is what
+makes it honest: a skipped remit contributes no visits *and* no reconciliation
+occurrence, so it can neither restate an amount nor mark another remit's visit
+as a duplicate from outside the run. It is one filter applied once, ahead of
+**both** the schedule and the employees file, so the two outputs can never
+disagree about what was in scope.
+
+Leaving it empty processes every uploaded remit, exactly as before; data is
+never dropped unless you ask for it. The active cutoff, and every remit it
+skipped, are named in the page and in the employees section. A remit whose
+header `DATE:` cannot be read is **processed rather than dropped**, and
+flagged — losing payments silently is the worse failure.
 
 ### Where new rows go
 
@@ -393,12 +409,14 @@ specific invited viewers) can open it, rather than leaving it public.
 2. Upload one or more remittance PDFs.
 3. Optionally upload `List_of_Patients_Mutual.xlsx` to source the `DX` column.
 4. Optionally upload `AMSMC_employees.xlsx` to fill the provider tabs.
-5. Optionally set **Ignore visits before (service date)**. Leave it empty to
-   process everything. When set, visits served before that date are dropped
-   from the whole run — schedule *and* employees file — so re-uploading a remit
-   covering sessions the providers have already archived cannot re-add them. A
-   visit dated on the cutoff itself is kept, and the active cutoff is shown in
-   the preview.
+5. Optionally set **Ignore EOBs dated before**. Leave it empty to process
+   every uploaded remit. When set, any remittance whose **header `DATE:`** is
+   before that date is skipped whole — every visit in it is excluded, from the
+   schedule *and* the employees file — so re-uploading a batch the providers
+   have already archived cannot re-apply it. This is the EOB/check date, **not**
+   the service date: a remit that is kept keeps all of its visits, however old
+   the sessions. A remit dated on the cutoff itself is processed. The page
+   names the active cutoff and every remit it skipped.
 6. Read the summary line: *N visits parsed · X to fill · Y new rows · Z skipped
    (already paid) · W need review*.
 7. Work through the preview table. Untick anything you do not want applied.
@@ -588,10 +606,13 @@ BAA-covered**, so processing real PHI there is itself a gap — see
   is deliberate — the alternative is guessing from the tab roster, which
   attributes the physician's own patients to whichever associate happens to
   share them.
-- **The service-date cutoff is a blunt filter.** It drops visits by service
-  date alone, for the whole run. It does not know which ones were already
-  reconciled, so a cutoff set too late silently skips work that still needed
-  doing. It is empty by default for that reason.
+- **The EOB-date cutoff is all-or-nothing per remit.** It skips a remittance
+  by its header `DATE:` alone. It does not know which claims inside it were
+  already reconciled, so a cutoff set too late skips a whole remit that still
+  had work in it — and the page says which remits it skipped for exactly that
+  reason. It is empty by default. There is deliberately no service-date
+  equivalent: splitting a remit by service date would drop part of a payment
+  batch you are reconciling as a unit.
 - **Workbook repair.** Excel writes `<family val="18">`/`"34"` font attributes
   that openpyxl's schema rejects (it caps the value at 14). The real schedule
   hits this. The app clamps that one attribute in an in-memory copy of the zip
