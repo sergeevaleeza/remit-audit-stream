@@ -1,5 +1,0 @@
-{
-  "_comment": "Copy this file to employee_npi.local.json (repo root) and fill in each associate's real PERF PROV NPI as it appears on the remittance service lines. employee_npi.local.json is gitignored and never committed. Keys are provider tab names in AMSMC_employees.xlsx; values are 10-digit NPIs. A tab listed here may have visits APPENDED to it when the EOB carries that NPI. Omit a tab whose sessions bill under the supervising physician's NPI (incident-to) -- it stays fill-only, which is the safe default.",
-  "Ana": "1000000011",
-  "Oxana": "1000000012"
-}

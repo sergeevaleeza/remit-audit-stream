@@ -138,10 +138,10 @@ an `[npi_to_doctor]` table in Streamlit secrets when deployed. See
 An NPI outside this table leaves `Comment` blank and flags the visit for review.
 
 The last two are associates who bill under their own NPI rather than
-incident-to. That is a separate mapping from this one — see
-*[The tab → NPI mapping](#the-tab--npi-mapping)* — because it decides
-something different: not what to write in `Comment`, but which employee tab a
-session may be **added** to.
+incident-to. Because their `Comment` text **is** their employees-tab name,
+this same mapping also decides which tab a session may be **added** to — see
+*[The tab → NPI mapping](#the-tab--npi-mapping)*. It is one map with two jobs,
+deliberately: a second one only drifted.
 
 ### DX reference (`List_of_Patients_Mutual.xlsx`)
 
@@ -260,20 +260,30 @@ performed the work, and only the EOB can make it.
 
 #### The tab → NPI mapping
 
-Appends need to know each associate's own NPI. Like the provider mapping, the
-real values are **never committed**: the app ships a synthetic placeholder
-(`remit/config.py`). To use real values, copy `employee_npi.example.json` to
-`employee_npi.local.json` (repo root, gitignored), or set an `[employee_npi]`
-table in Streamlit secrets when deployed.
+Appends need to know each associate's own NPI. **This is not configured
+separately** — it is derived by inverting the one
+[NPI → doctor](#npi--doctor) mapping, so there is nothing extra to fill in and
+nothing that can drift out of step with the `Comment` column.
 
-| Tab | NPI | Appends? |
+A tab is matched to an NPI when that NPI's name **is** the tab name (compared
+case- and whitespace-insensitively). So with a mapping of:
+
+| NPI | Comment |
+|---|---|
+| `<physician NPI>` | Dr. Levinson |
+| `<Oxana's NPI>` | Oxana |
+| `<Ana's NPI>` | Ana |
+
+| Tab | Resolved NPI | Appends? |
 |---|---|---|
-| Ana | her own PERF PROV NPI | yes, for visits carrying it |
-| Oxana | her own PERF PROV NPI | yes, for visits carrying it |
-| Marcia | *(none — bills incident-to)* | **no, fill-only** |
+| Ana | the NPI whose `Comment` is `Ana` | yes, for visits carrying it |
+| Oxana | the NPI whose `Comment` is `Oxana` | yes, for visits carrying it |
+| Marcia | *(none — bills incident-to under the physician)* | **no, fill-only** |
 
-A tab omitted from the mapping is fill-only, which is the safe default: the
-app can only ever *fail to add* a row, never add someone else's.
+A physician entry names no tab, which is exactly right: the supervising NPI
+proves nothing about which associate performed a visit. A tab the mapping does
+not name is fill-only, which is the safe default — the app can only ever
+*fail to add* a row, never add someone else's.
 
 #### Audit columns on each tab
 
@@ -317,9 +327,18 @@ disagree about what was in scope.
 
 Leaving it empty processes every uploaded remit, exactly as before; data is
 never dropped unless you ask for it. The active cutoff, and every remit it
-skipped, are named in the page and in the employees section. A remit whose
-header `DATE:` cannot be read is **processed rather than dropped**, and
-flagged — losing payments silently is the worse failure.
+skipped, are named in the page, in the preview summary and in the employees
+section. A remit whose header `DATE:` cannot be read is **processed rather
+than dropped**, and flagged — losing payments silently is the worse failure.
+
+One interaction worth knowing. If the cutoff excludes a **paying** remit but
+keeps a later one that re-adjudicated the same visits as `OA-18` duplicates,
+those visits now have no paying occurrence in the run. They come back flagged
+**duplicate only — needs review**, unticked, and nothing is written. That is
+the safe outcome rather than a bug — the alternative would be recording the
+duplicate's `$0.00` as if it were the payment — but a sudden crop of
+*duplicate only* rows is the signal that your cutoff cut through a remit pair.
+Move the cutoff back to include the paying remit.
 
 ### Where new rows go
 

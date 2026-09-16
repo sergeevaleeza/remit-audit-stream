@@ -442,3 +442,139 @@ def test_eob_visit_is_immutable(visits_for_tabs):
     with pytest.raises(Exception):
         visits_for_tabs[0].payment = 1.0
     assert isinstance(visits_for_tabs[0], EobVisit)
+
+
+# --- Single-source NPI mapping (regression) ---------------------------------
+#
+# The tab gate once read a *second*, separately-configured map. Whoever filled
+# in the real NPIs for the `Comment` column had no reason to know a parallel
+# map also needed them, so the gate kept comparing against placeholders and
+# every real associate visit was reported "not that tab's provider" and swept
+# into the no-tab bucket. These pin the two paths to one map.
+
+#: A deployment-shaped mapping: a supervising physician who names no tab, plus
+#: two associates whose Comment text IS their employees-tab name. The NPIs are
+#: fictional (the real ones are never committed -- see SECURITY.md).
+REAL_SHAPED_MAP = {
+    "1000009001": "Dr. Levinson",   # supervising physician -- names no tab
+    "1000009002": "Oxana",
+    "1000009003": "Ana",
+}
+
+
+def _remap(monkeypatch, mapping):
+    """Point the one NPI map at `mapping`, everywhere that reads it."""
+    from remit import config, employees
+
+    monkeypatch.setattr(config, "NPI_TO_DOCTOR", mapping)
+    employee_npi = config._resolve_employee_npi()
+    for module in (config, employees):
+        monkeypatch.setattr(module, "EMPLOYEE_NPI", employee_npi, raising=False)
+    appends = tuple(n for n in EMPLOYEE_SHEETS if n in employee_npi)
+    for module in (config, employees):
+        monkeypatch.setattr(module, "EMPLOYEE_APPEND_SHEETS", appends, raising=False)
+    return employee_npi
+
+
+def test_the_tab_gate_is_derived_from_the_comment_map(monkeypatch):
+    """One map, inverted -- not a second one that can be left unconfigured."""
+    from remit.config import _resolve_employee_npi
+
+    monkeypatch.setattr("remit.config.NPI_TO_DOCTOR", REAL_SHAPED_MAP)
+    assert _resolve_employee_npi() == {"Ana": "1000009003", "Oxana": "1000009002"}
+
+
+def test_a_physician_entry_names_no_tab(monkeypatch):
+    """Levinson bills Marcia's sessions incident-to; that owns no tab."""
+    from remit.config import _resolve_employee_npi
+
+    monkeypatch.setattr("remit.config.NPI_TO_DOCTOR", REAL_SHAPED_MAP)
+    resolved = _resolve_employee_npi()
+    assert "Marcia" not in resolved
+    assert "1000009001" not in resolved.values()
+
+
+def test_changing_the_map_moves_both_paths_together(monkeypatch):
+    """The regression: the two must never be able to disagree."""
+    from remit.config import _resolve_employee_npi
+    from remit.pdf_parser import Visit
+
+    swapped = {"1000009003": "Oxana", "1000009002": "Ana"}
+    monkeypatch.setattr("remit.config.NPI_TO_DOCTOR", swapped)
+    monkeypatch.setattr("remit.pdf_parser.NPI_TO_DOCTOR", swapped)
+
+    # The `Comment` path...
+    visit = Visit(patient="X, Y", service_date=date(2026, 6, 1),
+                  npi="1000009003", billed_date=date(2026, 6, 30))
+    assert visit.doctor == "Oxana"
+    # ...and the tab gate agree, because they are the same map.
+    assert _resolve_employee_npi()["Oxana"] == "1000009003"
+
+
+def test_tab_names_match_case_and_space_insensitively(monkeypatch):
+    from remit.config import _resolve_employee_npi
+
+    monkeypatch.setattr("remit.config.NPI_TO_DOCTOR",
+                        {"1000009003": "  ana ", "1000009002": "OXANA"})
+    assert _resolve_employee_npi() == {"Ana": "1000009003", "Oxana": "1000009002"}
+
+
+def test_an_unconfigured_map_leaves_every_tab_fill_only(monkeypatch):
+    """Safe failure: the app can fail to add a row, never add someone else's."""
+    from remit.config import _resolve_employee_npi
+
+    monkeypatch.setattr("remit.config.NPI_TO_DOCTOR", {"1000009001": "Dr. Levinson"})
+    assert _resolve_employee_npi() == {}
+
+
+def test_there_is_no_second_configurable_npi_source(monkeypatch):
+    """The invariant. `EMPLOYEE_NPI` is always the inversion of the one map.
+
+    Nothing may reintroduce a separately-configured tab->NPI map: an operator
+    who sets the real NPIs once must not have to know about a second place.
+    """
+    from remit import config
+
+    def boom(*args, **kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("the tab gate consulted a second config source")
+
+    monkeypatch.setattr(config, "_load_local_map", boom)
+    monkeypatch.setattr(config, "_load_secrets_map", boom)
+    monkeypatch.setattr(config, "NPI_TO_DOCTOR", REAL_SHAPED_MAP)
+
+    assert config._resolve_employee_npi() == {
+        "Ana": "1000009003", "Oxana": "1000009002",
+    }
+    assert not hasattr(config, "_SYNTHETIC_EMPLOYEE_NPI")
+
+
+def test_a_supervising_npi_fills_an_associate_row_without_flagging(changes):
+    """`Castellano` 03/26 is Ana's, billed incident-to. Normal, not a conflict."""
+    change = change_for(changes, "Castellano", "03/26/2026", sheet="Ana")
+    assert change.npi == SUPERVISING_NPI
+    assert change.action == EMP_ACTION_FILL
+    assert not change.needs_review
+    assert change.accepted
+
+
+def test_an_already_filled_row_is_skipped_not_flagged(employee_sheets,
+                                                      visits_for_tabs):
+    """A row with nothing blank left needs no write and is not a problem."""
+    from remit.config import EMP_ACTION_NOTHING
+
+    first = plan_employee_changes(employee_sheets, visits_for_tabs, today=STAMP)
+    filled = change_for(first, "Ravensworth", "06/02/2026", sheet="Ana")
+    assert filled.action == EMP_ACTION_FILL
+
+    # Apply, re-read, re-plan: the same row now has nothing left to write.
+    from pathlib import Path
+    payload = (Path(__file__).parent / "fixtures"
+               / "AMSMC_employees_sample.xlsx").read_bytes()
+    updated, _ = build_updated_employees(payload, first)
+    second = plan_employee_changes(read_sheets(load_employees_workbook(
+        updated.getvalue())), visits_for_tabs, today=STAMP)
+
+    again = change_for(second, "Ravensworth", "06/02/2026", sheet="Ana")
+    assert again.action == EMP_ACTION_NOTHING
+    assert not again.needs_review
+    assert not again.fills

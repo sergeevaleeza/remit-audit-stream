@@ -226,27 +226,42 @@ EMPLOYEE_COL_DATE = "Date of Session"
 # are billed incident-to under the supervising physician, so her tab roster --
 # not the remit -- defines what is hers. That is why she is fill-only.
 #
-# Like NPI_TO_DOCTOR, the real values are NEVER committed. The default below
-# is a synthetic placeholder for local development and the test suite. To use
-# real values, either:
+# This is DERIVED by inverting NPI_TO_DOCTOR rather than configured separately.
+# A second map was a bug: whoever filled in the real NPIs for the `Comment`
+# column had no reason to know a parallel map also needed them, so the gate
+# silently kept comparing against placeholders and every real visit was
+# reported as "not that tab's provider". One source of truth cannot drift.
 #
-#   1. Copy `employee_npi.example.json` to `employee_npi.local.json` (repo
-#      root) and fill in the real tab -> NPI pairs. That file is gitignored.
-#   2. On Streamlit Community Cloud, add an `[employee_npi]` table to the
-#      app's Secrets instead of shipping a file.
+# A tab is matched to an NPI when that NPI's doctor name IS the tab name
+# (compared case- and whitespace-insensitively). A physician entry such as
+# `Dr. Levinson` names no tab, so it maps to none -- which is exactly right:
+# the supervising NPI proves nothing about which associate performed a visit.
 
-_SYNTHETIC_EMPLOYEE_NPI = {
-    "Ana": "1000000011",
-    "Oxana": "1000000012",
-}
+
+def _npi_key(value: str) -> str:
+    """Fold a name for comparison. Mirrors `matching._normalize_token`.
+
+    Duplicated rather than imported: `matching` imports this module, so the
+    dependency cannot run the other way.
+    """
+    return " ".join(str(value or "").split()).lower()
 
 
 def _resolve_employee_npi() -> dict[str, str]:
-    return (
-        _load_local_map("REMIT_EMPLOYEE_NPI_PATH", "employee_npi.local.json")
-        or _load_secrets_map("employee_npi")
-        or dict(_SYNTHETIC_EMPLOYEE_NPI)
-    )
+    """Provider tab -> that associate's own PERF PROV NPI, from NPI_TO_DOCTOR.
+
+    Only tabs named by the map get an entry; the rest are fill-only, which is
+    the safe default (the app can fail to add a row, never add someone
+    else's). If several NPIs name one tab the first wins, so a mistyped
+    duplicate cannot quietly change which NPI a tab answers to.
+    """
+    wanted = {_npi_key(name): name for name in EMPLOYEE_SHEETS}
+    resolved: dict[str, str] = {}
+    for npi, doctor in NPI_TO_DOCTOR.items():
+        tab = wanted.get(_npi_key(doctor))
+        if tab is not None and tab not in resolved:
+            resolved[tab] = str(npi)
+    return resolved
 
 
 #: Provider tab -> that associate's own PERF PROV NPI.
@@ -275,7 +290,7 @@ EMP_ACTION_NO_MATCH = "No EOB match"
 EMP_ACTION_MISMATCH = "Practitioner mismatch - needs review"
 EMP_ACTION_AMBIGUOUS = "Ambiguous EOB match - needs review"
 EMP_ACTION_UNASSIGNED = "Unassigned - needs manual placement"
-EMP_ACTION_NOTHING = "Nothing to fill"
+EMP_ACTION_NOTHING = "Skip (already recorded)"
 
 # --- Name normalisation -----------------------------------------------------
 

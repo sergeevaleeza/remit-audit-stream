@@ -3,6 +3,61 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.1] — 2026-09-15
+
+### Fixed — NPI↔tab routing used a second, separately-configured map
+
+Visits whose EOB NPI **did** match a tab's provider were reported
+*"not that tab's provider — add by hand"* and swept into the belongs-to-no-tab
+bucket, so NPI-matched Ana/Oxana visits were never filled or appended.
+
+`EMPLOYEE_NPI` was configured independently of `NPI_TO_DOCTOR` — its own
+`employee_npi.local.json` / `[employee_npi]` secrets table, with a synthetic
+fallback. Whoever set the clinic's real NPIs for the `Comment` column had no
+reason to know a parallel map also needed them, so the tab gate went on
+comparing real remit NPIs against placeholders and matched nothing. The
+`Comment` path was correct throughout, which is why the schedule looked fine
+while the employees tabs did not.
+
+**The tab → NPI mapping is now derived by inverting `NPI_TO_DOCTOR`**, matching
+a tab when that NPI's name is the tab name (case- and whitespace-insensitively).
+One source of truth cannot drift. Concretely, with the real mapping loaded:
+
+- the NPI whose `Comment` is "Ana" → tab **Ana**; the one whose `Comment` is
+  "Oxana" → tab **Oxana**.
+- the supervising physician's NPI (`Comment` "Dr. …") names no tab, so it stays
+  a non-conflict — it proves nothing about which associate performed a visit.
+- Marcia is unnamed by the map and so remains fill-only, as before.
+
+Effects on the reported cases: an Oxana-NPI visit missing from her tab is
+**appended** instead of flagged; an Ana-NPI visit already present and filled is
+**skipped** with no flag; a visit matched by name and date whose NPI belongs to
+a *different* associate is still flagged *practitioner mismatch*.
+
+### Removed
+
+- `employee_npi.example.json`, the `employee_npi.local.json` override, the
+  `[employee_npi]` secrets table and `REMIT_EMPLOYEE_NPI_PATH`. There is no
+  second place to configure NPIs any more, and a test asserts the resolver
+  consults no other source.
+
+### Changed
+
+- `EMP_ACTION_NOTHING` now reads *"Skip (already recorded)"* rather than
+  *"Nothing to fill"*, matching the schedule side's wording for the same
+  outcome: a row with nothing blank left needs no write and is not a problem.
+
+### Added — tests
+
+- The single-source regression: changing the one map moves the `Comment` path
+  and the tab gate together; a physician entry names no tab; tab names match
+  case- and whitespace-insensitively; an unconfigured map leaves every tab
+  fill-only rather than guessing.
+- A supervising-NPI visit fills an associate's existing row without flagging.
+- An already-filled row re-plans as *skip*, not as a flag.
+
+447 tests pass (was 439).
+
 ## [1.7.0] — 2026-09-15
 
 The employees workbook is now populated **directly from the reconciled EOB
@@ -959,6 +1014,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.7.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.7.1
 [1.7.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.7.0
 [1.6.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.6.0
 [1.5.2]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.5.2

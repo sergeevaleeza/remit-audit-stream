@@ -132,7 +132,8 @@ def plan_to_frame(changes) -> pd.DataFrame:
     )
 
 
-def render_summary(counts: dict[str, int]) -> None:
+def render_summary(counts: dict[str, int], cutoff: date | None = None,
+                   skipped_remits: int = 0, total_remits: int = 0) -> None:
     st.markdown(
         f"**{counts['visits']} visits parsed** · "
         f"**{counts['fill']}** to fill · "
@@ -141,6 +142,13 @@ def render_summary(counts: dict[str, int]) -> None:
         f"**{counts['skip']}** skipped (already recorded) · "
         f"**{counts['review']}** need review"
     )
+    # The scope of the run belongs next to its counts: "12 visits parsed" means
+    # something different when a remit was left out of the run entirely.
+    scope = cutoff_label(cutoff)
+    if skipped_remits:
+        scope += (f" — {skipped_remits} of {total_remits} uploaded remit(s) "
+                  "skipped whole")
+    st.caption(scope)
     columns = st.columns(6)
     for column, (label, key) in zip(
         columns,
@@ -552,7 +560,7 @@ warn_on_duplicate_checks([d for d in documents if d.filename in processed_remits
 # --- Preview ---------------------------------------------------------------
 
 st.header("Preview proposed changes")
-render_summary(summarize(plan))
+render_summary(summarize(plan), cutoff, len(skipped_remits), len(documents))
 render_review_items(plan)
 render_telehealth_flags(plan)
 render_employee_preview(employee_changes, cutoff)
