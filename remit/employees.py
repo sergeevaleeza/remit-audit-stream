@@ -47,6 +47,7 @@ from .config import (
     EMPLOYEE_APPEND_SHEETS,
     EMPLOYEE_AUDIT_COLUMNS,
     EMPLOYEE_COL_COPAY_EOB,
+    EMPLOYEE_COPAY_COLUMN,
     COL_CHECK_EFT,
     COL_PROCESSED_ON,
     EMPLOYEE_COL_DATE,
@@ -163,6 +164,16 @@ class EmployeeSheet:
     @property
     def payment_column(self) -> int | None:
         label = EMPLOYEE_PAYMENT_COLUMN.get(self.name)
+        return column_for(self.columns, label) if label else None
+
+    @property
+    def copay_column(self) -> int | None:
+        """Where this tab records a copay the plan actually paid.
+
+        Ana keeps hers in `Co-pay to Ana`, Marcia and Oxana in
+        `Co-payment Paid`. Resolved by header text like everything else.
+        """
+        label = EMPLOYEE_COPAY_COLUMN.get(self.name)
         return column_for(self.columns, label) if label else None
 
     def has_patient(self, patient: str) -> bool:
@@ -299,6 +310,12 @@ class EobVisit:
     #: The paying remit's check/EFT number -- per the OA-18 rule this is never
     #: a duplicate's.
     check_eft: str = ""
+    #: The paying plan.
+    payer: str = ""
+    #: True when this is a secondary plan settling what the primary left to the
+    #: patient (CARC 23). Its money is a *copay being paid*, so it goes to the
+    #: tab's copay column, never to the insurance-payment column.
+    crossover: bool = False
     #: Set when the visit itself is unsafe to record (currently: every
     #: occurrence was an OA-18 duplicate, so no remit actually paid it). Any
     #: change built from it is surfaced for review and never auto-accepted.
@@ -351,6 +368,8 @@ def eob_visits(visits: Sequence[Any]) -> list[EobVisit]:
                 copay=visit.copay,
                 payment=visit.payment,
                 check_eft=visit.authoritative_eft or "",
+                payer=getattr(visit, "payer", ""),
+                crossover=bool(getattr(visit, "crossover", False)),
                 # A visit seen only as an exact duplicate was adjudicated at
                 # $0 because the paying remit was never uploaded. Recording
                 # that $0 in a provider's pay sheet would be wrong, so it is
@@ -422,12 +441,20 @@ def _pick_match(matches: Sequence[EobVisit],
 
 def _mapped_fills(sheet: EmployeeSheet, row_values: dict[str, Any],
                   visit: EobVisit) -> dict[int, Any]:
-    """Blank mapped cells and what to put in them, as {column index: value}."""
-    proposals = [
-        (column_for(sheet.columns, EMPLOYEE_COL_INSURANCE), visit.insurance),
-        (column_for(sheet.columns, EMPLOYEE_COL_COPAY_EOB), visit.copay),
-        (sheet.payment_column, visit.payment),
-    ]
+    """Blank mapped cells and what to put in them, as {column index: value}.
+
+    A crossover is the one case that maps differently: the secondary plan paid
+    the patient's coinsurance, so its amount is a *copay paid*, and writing it
+    into the insurance-payment column would double-count the visit's income.
+    """
+    if visit.crossover:
+        proposals = [(sheet.copay_column, visit.payment)]
+    else:
+        proposals = [
+            (column_for(sheet.columns, EMPLOYEE_COL_INSURANCE), visit.insurance),
+            (column_for(sheet.columns, EMPLOYEE_COL_COPAY_EOB), visit.copay),
+            (sheet.payment_column, visit.payment),
+        ]
     fills: dict[int, Any] = {}
     reverse = {index: key for key, index in sheet.columns.items()}
     for column, value in proposals:
@@ -455,6 +482,52 @@ def _change_from(visit: EobVisit, sheet: EmployeeSheet, action: str,
         check_eft=visit.check_eft,
         **kwargs,
     )
+
+
+def _plan_existing_row(sheet: EmployeeSheet, row: EmployeeRow,
+                       matches: Sequence[EobVisit]
+                       ) -> tuple[EmployeeChange, tuple[str, date, str]]:
+    """Plan one payer's contribution to one existing tab row.
+
+    `matches` are the reconciled visits from a *single* payer role -- all
+    primary, or all crossover -- so anything left to disambiguate here is a
+    genuine two-provider collision rather than the ordinary primary/secondary
+    pair.
+    """
+    match, ambiguity = _pick_match(matches, sheet.name)
+    fills = _mapped_fills(sheet, row.values, match)
+
+    if ambiguity:
+        return _change_from(
+            match, sheet, EMP_ACTION_AMBIGUOUS,
+            row_num=row.row_num, fills=fills,
+            note=f"{ambiguity} - confirm which one belongs here",
+            accepted=False,
+        ), match.key
+
+    conflict = _practitioner_conflict(match, sheet.name)
+    if conflict:
+        return _change_from(
+            match, sheet, EMP_ACTION_MISMATCH,
+            row_num=row.row_num, fills=fills,
+            note=(
+                f"EOB was billed under {conflict}'s NPI {match.npi}, "
+                f"but this is the {sheet.name} tab"
+            ),
+            accepted=False,
+        ), match.key
+
+    if match.review_note:
+        return _change_from(
+            match, sheet, EMP_ACTION_AMBIGUOUS,
+            row_num=row.row_num, fills=fills,
+            note=match.review_note, accepted=False,
+        ), match.key
+
+    return _change_from(
+        match, sheet, EMP_ACTION_FILL if fills else EMP_ACTION_NOTHING,
+        row_num=row.row_num, fills=fills, accepted=bool(fills),
+    ), match.key
 
 
 def plan_employee_changes(sheets: dict[str, EmployeeSheet],
@@ -490,44 +563,18 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
                 ))
                 continue
 
-            match, ambiguity = _pick_match(matches, sheet.name)
-            placed.add(match.key)
-            fills = _mapped_fills(sheet, row.values, match)
-
-            if ambiguity:
-                changes.append(_change_from(
-                    match, sheet, EMP_ACTION_AMBIGUOUS,
-                    row_num=row.row_num, fills=fills,
-                    note=f"{ambiguity} - confirm which one belongs here",
-                    accepted=False,
-                ))
-                continue
-
-            conflict = _practitioner_conflict(match, sheet.name)
-            if conflict:
-                changes.append(_change_from(
-                    match, sheet, EMP_ACTION_MISMATCH,
-                    row_num=row.row_num, fills=fills,
-                    note=(
-                        f"EOB was billed under {conflict}'s NPI {match.npi}, "
-                        f"but this is the {sheet.name} tab"
-                    ),
-                    accepted=False,
-                ))
-                continue
-
-            if match.review_note:
-                changes.append(_change_from(
-                    match, sheet, EMP_ACTION_AMBIGUOUS,
-                    row_num=row.row_num, fills=fills,
-                    note=match.review_note, accepted=False,
-                ))
-                continue
-
-            changes.append(_change_from(
-                match, sheet, EMP_ACTION_FILL if fills else EMP_ACTION_NOTHING,
-                row_num=row.row_num, fills=fills, accepted=bool(fills),
-            ))
+            # A primary payment and a secondary plan's crossover for the same
+            # session are not competing matches. They pay different things --
+            # the insurance payment and the patient's coinsurance -- and map to
+            # different columns, so each is planned in its own right instead of
+            # being reported as an ambiguous double match.
+            for group in ([m for m in matches if not m.crossover],
+                          [m for m in matches if m.crossover]):
+                if not group:
+                    continue
+                change, key = _plan_existing_row(sheet, row, group)
+                placed.add(key)
+                changes.append(change)
 
     # 2. Append NPI-matched visits the tab does not have yet. Only tabs whose
     #    associate bills under her own NPI take appends; Marcia never does.
@@ -540,6 +587,11 @@ def plan_employee_changes(sheets: dict[str, EmployeeSheet],
             if visit.npi != own:
                 continue
             placed.add(visit.key)
+            if visit.crossover:
+                # A crossover settles a session that should already be on the
+                # tab from the primary payment. Starting a row from it would
+                # create a payment-less entry, so it only ever fills.
+                continue
             if sheet.has_session(visit.patient, visit.session_date):
                 continue  # already in the tab -- dedup, so re-runs add nothing
             changes.append(_change_from(

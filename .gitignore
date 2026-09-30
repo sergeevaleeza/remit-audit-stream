@@ -34,3 +34,12 @@ phi_denylist.local.txt
 # test fixture is AMSMC_employees_sample.xlsx and is tracked deliberately.
 AMSMC_employees*.xlsx
 !tests/fixtures/AMSMC_employees_sample.xlsx
+
+# The 835 remittance database and the extractor's CSV exports are PHI for two
+# payers. Never committed, and never uploaded to a hosted deployment.
+*.sqlite
+*.sqlite3
+*.db
+remittance_data.json
+/output/
+*.csv

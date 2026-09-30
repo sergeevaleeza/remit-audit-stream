@@ -3,6 +3,125 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8.0] — 2026-09-29
+
+The structured **835 database** is now the single remittance source, replacing
+PDF parsing, and the app covers **two payers** (Medicare via Noridian, and
+HPSM) across **two schedule sheets**. 487 tests pass (was 447).
+
+### Changed — the 835 database replaces the PDF parser as the source
+
+`remittance_data.sqlite`, built by `remits-extractor`, is read instead of
+parsing remittance PDFs. The extractor has already flattened every 835 into one
+row per service line in `master_remittance_records`, so the fragile part of the
+old pipeline — finding fields by shape in fixed-width text — is gone.
+
+Only the *source* changed. `remit/db_source.py` turns database rows into the
+same `ServiceLine` / `RemitDocument` objects the parser produced and hands them
+to the existing `aggregate_visits`, so per-visit aggregation, the OA-18
+duplicate rule, multi-EFT reconciliation, never-overwrite, row placement, the
+`Processed On` / `Remit Check/EFT #` audit columns and the EOB-date cutoff all
+apply unchanged. The cutoff now compares each remit's `payment_date`.
+
+- Amount columns are TEXT and are cast. An unparseable value is treated as
+  **absent**, never silently as `0.00`.
+- Dates are already ISO. Names arrive uppercase and are title-cased by the one
+  existing helper that writes names, so both paths look identical downstream.
+- The database is opened **read-only**; an upload is staged in a private
+  temporary file that is deleted immediately.
+- **Each payer is aggregated separately.** `aggregate_visits` keys a visit on
+  (patient, service date, NPI) with no payer in the key, so a Medicare line and
+  the HPSM crossover settling the same session would otherwise merge and the
+  later HPSM payment would replace the Medicare payment.
+
+### Changed — the PDF path is disabled, not deleted
+
+`DB_SOURCE_SCOPE` (env `REMIT_SOURCE_SCOPE`) is `db` by default: the database is
+the only source and the PDF uploader is not offered. Setting it to `pdf`
+re-enables the PDF uploader for a one-off paper remit. **Never both** — the same
+visits would be counted twice. The parser itself is untouched and still tested;
+it feeds the same reconciliation the database now feeds.
+
+### Added — two payers, two schedule sheets
+
+`2026 Medical` is now a real schedule sheet alongside `2026 Medicare`, with the
+same column layout and header row. Columns are resolved by header text on each
+sheet independently, and **both sheets now get the `Processed On` /
+`Remit Check/EFT #` audit columns**.
+
+Only `HEALTH PLAN OF SAN MATEO` and `NORIDIAN HEALTHCARE SOLUTIONS, LLC` are in
+scope. Carelon and anything else is filtered out in SQL, so an out-of-scope
+plan cannot reach the rest of the app by accident.
+
+**Existing rows define the sheet.** Staff already file each visit onto the
+correct tab, so a fill follows the row: `ScheduleRow` and `Change` both carry a
+`sheet`, and `apply_changes` writes each sheet independently and sums the
+totals. A brand-new visit is routed by payer instead — Noridian to
+`2026 Medicare`, HPSM to `2026 Medical`.
+
+`Ins` is set only on appended rows: `Medicare` on the Medicare sheet,
+`San Mateo` on the Medical sheet, and `POS 10(95)` on either when the visit is
+telehealth. Telehealth is modifier `95`; because HPSM sends no place of service
+at all, an **unknown** POS lets the modifier decide alone, while a POS that is
+present and is not `10` still rules telehealth out.
+
+### Added — HPSM crossovers settle Medicare coinsurance
+
+An HPSM line carrying **CARC 23** is not a visit of its own: HPSM is paying as
+Medicare's secondary. Such a line is matched to the `2026 Medicare` row for the
+same patient and service date, and its amount is written to that row's
+**`Co-pays Paid`** — never its `Payment`, `Co-pay` or `Ins`, and never as a new
+`2026 Medical` row.
+
+- `Co-pays Paid` therefore left `NEVER_TOUCH_COLUMNS`. It is the only thing ever
+  written there, and never over a figure staff entered.
+- A crossover with **no matching Medicare visit** is flagged
+  *Crossover, no Medicare visit found - verify* and writes nothing, even if
+  ticked. Guessing a sheet, or dropping the money on `2026 Medical` as though
+  HPSM were primary, would both be wrong.
+
+### Added — HPSM copays in the employees workbook
+
+The primary (Medicare) payment still goes to each tab's insurance-payment
+column, unchanged. A crossover's amount goes to that tab's **copay** column,
+resolved by header text: Ana `Co-pay to Ana` (column I), Marcia and Oxana
+`Co-payment Paid` (column G). Routing is by the visit's
+`rendering_provider_npi`, so a visit rendered by the supervising physician
+reaches no associate tab.
+
+A crossover only ever *fills*; it never appends, because the session should
+already be on the tab from the primary payment.
+
+### Fixed — a primary and its crossover are not an ambiguous match
+
+Both match the same employee row on patient + `Date of Session`, and both carry
+the same NPI, so the tab's own NPI could not break the tie and the pair was
+reported *ambiguous EOB match*. They are not competing: they pay different
+things into different columns. Each payer role is now planned in its own right,
+and a genuine two-provider collision is still flagged.
+
+### Added — local-only handling of the database
+
+The database is PHI for two payers. It is gitignored (`*.sqlite`, `*.db`, the
+extractor's CSV exports and `remittance_data.json`), and the uploader is
+**refused on a hosted runtime** — Streamlit Community Cloud is detected by
+`/mount/src` — unless `REMIT_ALLOW_REMOTE_DB=1` is set deliberately.
+
+### Added — tests and fixtures
+
+- `tests/test_db_source.py` (40 tests): reading and casting the table, payer
+  filtering, per-payer aggregation, sheet routing per payer, the crossover
+  writing only `Co-pays Paid`, the orphan crossover writing nothing even when
+  ticked, both sheets written, `Ins` per sheet, telehealth without a POS, OA-18
+  not zeroing a payment, the cutoff on `payment_date`, the employees copay
+  columns, and that the PDF path is off but still works.
+- A synthetic 835 fixture, **generated at test time** rather than committed
+  (`tests/fixtures/make_db_fixture.py` + `synthetic_db_data.py`): fictional
+  names and member ids, the repo's synthetic NPIs, and one out-of-scope Carelon
+  line that must be filtered out.
+- The schedule fixture's `2026 Medical` is now a real second schedule sheet; the
+  untouched-decoy role moved to `2026 Dental`.
+
 ## [1.7.1] — 2026-09-15
 
 ### Fixed — NPI↔tab routing used a second, separately-configured map
@@ -1014,6 +1133,7 @@ outside the repo) shaped the implementation:
 - Each proposed new row was audited to confirm the patient/date combination is
   genuinely absent from the schedule rather than a missed match.
 
+[1.8.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.8.0
 [1.7.1]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.7.1
 [1.7.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.7.0
 [1.6.0]: https://github.com/your-org/remit-audit-stream/releases/tag/v1.6.0

@@ -18,6 +18,7 @@ import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .config import (
+    ACTION_CROSSOVER_ORPHAN,
     ACTION_FILL,
     ACTION_NEW,
     ACTION_UPDATE,
@@ -36,7 +37,9 @@ from .config import (
     COL_PROCESSED_ON,
     DATA_START_ROW,
     HEADER_ROW,
+    COL_COPAYS_PAID,
     NEVER_TOUCH_COLUMNS,
+    SCHEDULE_SHEETS,
     REQUIRED_COLUMNS,
     SHEET_NAME,
 )
@@ -119,6 +122,39 @@ def get_schedule_sheet(workbook: openpyxl.Workbook) -> Worksheet:
     return workbook[SHEET_NAME]
 
 
+def schedule_sheets(workbook: openpyxl.Workbook) -> dict[str, Worksheet]:
+    """Every schedule sheet present, by name. `2026 Medicare` is required.
+
+    `2026 Medical` is optional so a workbook that predates it still loads; the
+    HPSM half of a run simply has nowhere to append and says so.
+    """
+    found = {}
+    for name in SCHEDULE_SHEETS:
+        if name in workbook.sheetnames:
+            found[name] = workbook[name]
+    if SHEET_NAME not in found:
+        raise ScheduleError(
+            f"Workbook has no sheet named '{SHEET_NAME}'. "
+            f"Found: {', '.join(workbook.sheetnames)}"
+        )
+    return found
+
+
+def read_all_schedule_rows(workbook: openpyxl.Workbook
+                           ) -> tuple[list[ScheduleRow], dict[str, dict[str, int]]]:
+    """`(rows across every schedule sheet, columns per sheet)`.
+
+    Both sheets share the layout but are resolved independently by header text,
+    so a column sitting in a different position on one of them still works.
+    """
+    rows: list[ScheduleRow] = []
+    columns: dict[str, dict[str, int]] = {}
+    for name, worksheet in schedule_sheets(workbook).items():
+        columns[name] = resolve_columns(worksheet)
+        rows.extend(read_schedule_rows(worksheet, columns[name]))
+    return rows, columns
+
+
 def last_data_row(worksheet: Worksheet, columns: dict[str, int]) -> int:
     """Last row with a patient name, so appends land after real data."""
     patient_col = columns[COL_PATIENT]
@@ -130,7 +166,11 @@ def last_data_row(worksheet: Worksheet, columns: dict[str, int]) -> int:
 
 
 def read_schedule_rows(worksheet: Worksheet, columns: dict[str, int]) -> list[ScheduleRow]:
-    """Every data row of the sheet, as plain values for matching."""
+    """Every data row of the sheet, as plain values for matching.
+
+    Rows carry the sheet they came from, so a fill can write back to whichever
+    of the two schedule sheets staff actually filed the visit on.
+    """
     rows: list[ScheduleRow] = []
     for row in range(DATA_START_ROW, last_data_row(worksheet, columns) + 1):
         def cell(header: str) -> Any:
@@ -143,12 +183,14 @@ def read_schedule_rows(worksheet: Worksheet, columns: dict[str, int]) -> list[Sc
         rows.append(
             ScheduleRow(
                 row_num=row,
+                sheet=worksheet.title,
                 patient=cell(COL_PATIENT),
                 ins=cell(COL_INS),
                 data=cell(COL_DATA),
                 billed=cell(COL_BILLED),
                 payment=cell(COL_PAYMENT),
                 copay=cell(COL_COPAY),
+                copays_paid=cell(COL_COPAYS_PAID),
                 comment=cell(COL_COMMENT),
                 dx=cell(COL_DX),
                 cpt=cell(COL_CPT),
@@ -288,14 +330,41 @@ def _stamp_audit(worksheet: Worksheet, columns: dict[str, int],
             worksheet.cell(row=row_num, column=column).value = value
 
 
-def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dict[str, int]:
-    """Apply accepted fills and appends in place. Returns what was written.
+#: The counters every sheet contributes to.
+_STAT_KEYS = (
+    "filled_rows", "filled_cells", "updated_rows", "updated_cells",
+    "inserted_rows", "appended_rows", "new_rows", "skipped_non_blank",
+)
 
-    Blank cells are the only cells ever written on an existing row: every
-    proposed value is re-checked against the live cell immediately before
-    writing, so a populated cell is left exactly as it was.
+
+def apply_changes(workbook: openpyxl.Workbook, changes: Sequence[Change]) -> dict[str, int]:
+    """Apply accepted fills and appends across both schedule sheets.
+
+    Each sheet is written independently -- its own columns, its own audit
+    headers, its own row placement -- and the totals are summed, so a run that
+    touches only one sheet leaves the other untouched down to its header row.
     """
-    worksheet = get_schedule_sheet(workbook)
+    present = schedule_sheets(workbook)
+    totals = {key: 0 for key in _STAT_KEYS}
+
+    for name, worksheet in present.items():
+        for_sheet = [c for c in changes if c.sheet == name]
+        if not for_sheet:
+            continue
+        stats = _apply_to_sheet(worksheet, for_sheet)
+        for key in _STAT_KEYS:
+            totals[key] += stats[key]
+
+    # A change aimed at a sheet the workbook does not have cannot be written;
+    # surfacing it as a count keeps the caller honest about what was skipped.
+    missing = [c for c in changes
+               if c.sheet not in present and c.effective_action != ACTION_CROSSOVER_ORPHAN]
+    totals["skipped_missing_sheet"] = len(missing)
+    return totals
+
+
+def _apply_to_sheet(worksheet: Worksheet, changes: Sequence[Change]) -> dict[str, int]:
+    """Apply the changes aimed at one sheet. Never overwrites a populated cell."""
     columns = resolve_columns(worksheet)
 
     applies = [

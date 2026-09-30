@@ -17,9 +17,11 @@ import pdfplumber
 from .config import (
     CENTURY_PREFIX,
     CHECK_EFT_JOINER,
+    CROSSOVER_REASON_CODE,
     DATE_FMT,
     INSURANCE_VALUE,
     NPI_TO_DOCTOR,
+    PAYER_INSURANCE,
     TELEHEALTH_INSURANCE_LABEL,
 )
 
@@ -56,6 +58,18 @@ POS_TELEHEALTH = "10"
 #: The telehealth modifier printed after PROC.
 MODIFIER_TELEHEALTH = "95"
 
+
+def _is_telehealth(pos: "str | None", modifiers: Iterable[str]) -> bool:
+    """POS 10 (the patient's home) plus the 95 modifier.
+
+    Some 835 payers leave the place of service off the service line entirely
+    -- HPSM does -- so an *unknown* POS lets the modifier decide on its own.
+    A POS that is present and is not 10 still rules telehealth out.
+    """
+    if MODIFIER_TELEHEALTH not in modifiers:
+        return False
+    return pos in (None, "") or pos == POS_TELEHEALTH
+
 # Group/reason adjustment codes: `CO-45`, `OA-18`, `CO-253`, `PR-1` ...
 _ADJ_CODE_RE = re.compile(r"\b([A-Z]{2})-(\d+)\b")
 
@@ -75,9 +89,18 @@ def adjustment_codes(text: str) -> tuple[str, ...]:
     return tuple(f"{group}-{reason}" for group, reason in _ADJ_CODE_RE.findall(text))
 
 
+def marks_reason(codes: Iterable[str], reason: str) -> bool:
+    """True when any code carries this reason number, whatever its group prefix.
+
+    Codes reach us as `OA-18` from a PDF and as a bare `18` from the 835
+    database, so only the part after the group prefix is compared.
+    """
+    return any(str(code).split("-", 1)[-1].strip() == reason for code in codes)
+
+
 def marks_duplicate(codes: Iterable[str]) -> bool:
     """True when any code is reason 18, whatever its group prefix."""
-    return any(code.split("-", 1)[-1] == DUPLICATE_REASON_CODE for code in codes)
+    return marks_reason(codes, DUPLICATE_REASON_CODE)
 
 # Evaluation & management codes sort before psychotherapy add-ons.
 _EM_PREFIX = "99"
@@ -119,10 +142,13 @@ class ServiceLine:
     modifiers: tuple[str, ...] = ()
     #: Group/reason codes from this line **and** its continuation lines.
     codes: tuple[str, ...] = ()
+    #: Paying plan, from the 835's `payer_name`. Blank on PDF-sourced lines,
+    #: which are Medicare by construction.
+    payer: str = ""
 
     @property
     def telehealth(self) -> bool:
-        return self.pos == POS_TELEHEALTH and MODIFIER_TELEHEALTH in self.modifiers
+        return _is_telehealth(self.pos, self.modifiers)
 
     @property
     def is_duplicate(self) -> bool:
@@ -154,6 +180,10 @@ class Visit:
     #: These are consistent across a visit's CPT lines on these remits.
     pos: str | None = None
     modifiers: set[str] = field(default_factory=set)
+
+    #: Paying plan, from the 835's `payer_name`. Decides which schedule sheet
+    #: a brand-new visit is appended to, and its `Ins` label.
+    payer: str = ""
 
     #: Group/reason codes seen on this occurrence's service lines.
     codes: set[str] = field(default_factory=set)
@@ -198,7 +228,17 @@ class Visit:
     @property
     def telehealth(self) -> bool:
         """POS 10 (patient's home) plus the 95 modifier."""
-        return self.pos == POS_TELEHEALTH and MODIFIER_TELEHEALTH in self.modifiers
+        return _is_telehealth(self.pos, self.modifiers)
+
+    @property
+    def crossover(self) -> bool:
+        """CARC 23: this payer is settling after a prior payer adjudicated.
+
+        On an HPSM line it means HPSM is paying as Medicare's secondary, so
+        the amount belongs in the Medicare row's `Co-pays Paid` rather than
+        starting a new row of its own.
+        """
+        return marks_reason(self.codes, CROSSOVER_REASON_CODE)
 
     @property
     def insurance(self) -> str:
@@ -253,16 +293,16 @@ class RemitDocument:
 
 
 def insurance_label(visit: "Visit") -> str:
-    """The `Ins` value for a visit: telehealth is called out, else Medicare.
+    """The `Ins` value for a visit: telehealth first, else the payer's label.
 
-    Replaces the old "Ins is always Medicare" constant. A visit billed from
-    the patient's home (POS 10) with the 95 modifier is a telehealth
-    encounter and is labelled `POS 10(95)` so it is visible in the schedule
-    and in the employees workbook.
+    A visit billed from the patient's home with the 95 modifier is a
+    telehealth encounter and is labelled `POS 10(95)` on either sheet, so it
+    is visible in the schedule and in the employees workbook. Otherwise the
+    payer decides: `Medicare` for Noridian, `San Mateo` for HPSM.
     """
     if visit.telehealth:
         return TELEHEALTH_INSURANCE_LABEL
-    return INSURANCE_VALUE
+    return PAYER_INSURANCE.get(visit.payer, INSURANCE_VALUE)
 
 
 def order_cpt_codes(codes: Iterable[str]) -> list[str]:
@@ -478,6 +518,7 @@ def aggregate_visits(documents: Sequence[RemitDocument]) -> list[Visit]:
                     service_date=line.service_date,
                     npi=line.npi,
                     billed_date=doc.billed_date or fallback_billed,
+                    payer=line.payer,
                 )
                 bucket[key] = visit
             visit.cpt_codes.append(line.proc)

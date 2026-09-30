@@ -1,9 +1,10 @@
 # Medicare Remittance → Patient Schedule Updater
 
 A Streamlit app for the clinic's billing workflow. Upload the patient schedule
-workbook and one or more Noridian Medicare Remittance Advice PDFs; the app
-parses every payment out of the PDFs, matches each visit to the right row of the
-`2026 Medicare` sheet, and shows you exactly what it proposes to change. Nothing
+workbook and the **835 remittance database** (`remittance_data.sqlite`, built by
+`remits-extractor`); the app reads every payment out of it, matches each visit to
+the right row of the `2026 Medicare` or `2026 Medical` sheet, and shows you
+exactly what it proposes to change. Nothing
 is written until you confirm — and when you do, you get a complete standalone
 copy of the workbook to download, with every other sheet, formula and format
 untouched. It is built for the person who reconciles remittances by hand and
@@ -13,6 +14,17 @@ needs the result to be auditable rather than fast.
 
 ## Features
 
+- **The 835 database is the source.** Payments come from
+  `master_remittance_records` in `remittance_data.sqlite`, not from parsing
+  PDFs. Read-only — nothing is ever written back to it. The PDF parser is kept
+  and still works, but its entry point is off by default; see
+  [Remittance source](#remittance-source).
+- **Two payers, two sheets.** Noridian (Medicare) and Health Plan of San Mateo,
+  onto `2026 Medicare` and `2026 Medical`. Every other payer in the database is
+  filtered out.
+- **HPSM crossovers settle Medicare coinsurance.** An HPSM line with CARC 23 is
+  Medicare's secondary payment, so it lands in the Medicare row's
+  `Co-pays Paid` rather than starting a row of its own.
 - **Parse → preview → download.** Every proposed change is shown in an editable
   table before anything happens. There is no path that writes a file without an
   explicit confirmation click.
@@ -74,6 +86,95 @@ needs the result to be auditable rather than fast.
 ---
 
 ## How it works
+
+### Remittance source
+
+Payments are read from the 835 database rather than parsed out of PDFs. The
+extractor has already flattened each 835 into one row per service line, so the
+app reads columns instead of locating fields by shape in fixed-width text.
+
+| Visit field | Database column |
+|---|---|
+| Patient | `patient_last_name` + `patient_first_name`, title-cased |
+| `Data` / service date | `service_from_date` (ISO) |
+| Provider NPI | `rendering_provider_npi` |
+| `Payment` | Σ `service_payment_amount` |
+| `Co-pay` | Σ `PR_adjustment_amount` |
+| `Co-pays Paid` | the HPSM crossover's `service_payment_amount` |
+| `Ins` | `Medicare` / `San Mateo`, or `POS 10(95)` when modifier `95` is present |
+| `CPT Code` | `procedure_code` (+ `modifier_1..4`) |
+| Check/EFT, remit date | `payment_trace_number`, `payment_date` |
+| Reason codes | `CARC_codes` — `18` is the duplicate rule, `23` a crossover |
+
+Amount columns are TEXT and are cast; a value that will not parse is treated as
+**absent**, never as `0.00`. Visits aggregate per
+**(patient, service date, rendering NPI)**, and **each payer is aggregated
+separately** — a Medicare line and the HPSM crossover settling the same session
+share all three key fields, so aggregating them together would let the
+secondary payment overwrite the primary one.
+
+Only these payers are in scope; anything else in the file is filtered out:
+
+| Payer | `claim_filing_indicator_code` | Sheet for new visits |
+|---|---|---|
+| `NORIDIAN HEALTHCARE SOLUTIONS, LLC` | `MB` | `2026 Medicare` |
+| `HEALTH PLAN OF SAN MATEO` | `HM` | `2026 Medical` |
+
+**The database is PHI and is local-only.** It is gitignored, and the uploader is
+refused on a hosted deployment (Streamlit Community Cloud) unless
+`REMIT_ALLOW_REMOTE_DB=1` is set deliberately. Run the app on the clinic's own
+machine.
+
+#### Re-enabling the PDF path
+
+`DB_SOURCE_SCOPE` in [`remit/config.py`](remit/config.py), or the
+`REMIT_SOURCE_SCOPE` environment variable:
+
+- `db` (default) — the database is the only source; no PDF uploader.
+- `pdf` — the PDF uploader instead, for a one-off paper remit.
+
+**Never run both.** The parser and its reconciliation are shared code, so the
+same visits would be counted twice. The PDF parser is deliberately kept and
+still covered by tests.
+
+### The two schedule sheets
+
+`2026 Medicare` and `2026 Medical` share the same column layout with headers on
+row 2, and each resolves its own columns by header text. Both carry the
+`Processed On` / `Remit Check/EFT #` audit columns.
+
+- **Filling follows the row.** Staff already file each visit onto the correct
+  tab, so an existing row is matched by patient (suffix-aware) +
+  `service_from_date` on **either** sheet and filled where it sits.
+- **Appending follows the payer.** A visit on neither sheet is appended to its
+  payer's sheet — Noridian to `2026 Medicare`, HPSM to `2026 Medical`.
+- **`Ins` is only ever set on an appended row.** `Medicare` or `San Mateo` by
+  sheet, or `POS 10(95)` when the visit is telehealth. An existing `Ins` is
+  left alone.
+
+#### HPSM crossovers
+
+An HPSM line carrying **CARC 23** means HPSM is paying as Medicare's secondary:
+it is settling what Medicare left the patient, on a visit that already exists.
+
+- It is matched to the `2026 Medicare` row for the same patient and service
+  date, and its amount is written to that row's **`Co-pays Paid`**.
+- It never touches that row's `Payment`, `Co-pay` or `Ins`, and never creates a
+  `2026 Medical` row.
+- If no Medicare row matches, it is flagged
+  *Crossover, no Medicare visit found — verify* and **nothing is written**, even
+  if you tick it. Expect a fair number of these: a crossover for a 2025 session
+  has no row on a 2026 sheet to attach to.
+
+`Co-pays Paid` is the one column this rule added to the writable set. It is the
+only thing ever written there, and never over a figure staff entered.
+
+#### Telehealth without a place of service
+
+Telehealth is modifier `95`. Noridian sends the real place of service in
+`location_number` (`02`/`10`/`11`); **HPSM sends none at all**. So an *unknown*
+POS lets the modifier decide on its own, while a POS that is present and is not
+`10` still rules telehealth out.
 
 ### PDF field mapping
 
@@ -425,7 +526,10 @@ specific invited viewers) can open it, rather than leaving it public.
 ## Usage
 
 1. Upload `List_of_Patients_Schedule.xlsx`.
-2. Upload one or more remittance PDFs.
+2. Upload `remittance_data.sqlite` — the 835 database from `remits-extractor`.
+   It is read-only and local-only; nothing is written back to it, and payers
+   other than Noridian and Health Plan of San Mateo are ignored. (With
+   `REMIT_SOURCE_SCOPE=pdf` this step is remittance PDFs instead.)
 3. Optionally upload `List_of_Patients_Mutual.xlsx` to source the `DX` column.
 4. Optionally upload `AMSMC_employees.xlsx` to fill the provider tabs.
 5. Optionally set **Ignore EOBs dated before**. Leave it empty to process
@@ -443,7 +547,10 @@ specific invited viewers) can open it, rather than leaving it public.
    column shows what would go into a blank `DX` cell, and **Processed On** /
    **Remit Check/EFT #** show the audit stamps.
 8. Review the per-provider **Employees file** section. Every value there comes
-   **directly from the EOB**, not from the updated schedule. Each row shows its
+   **directly from the EOB**, not from the updated schedule. A Medicare payment
+   goes to the tab's insurance-payment column; an **HPSM crossover copay** goes
+   to the tab's copay column — Ana `Co-pay to Ana` (I), Marcia and Oxana
+   `Co-payment Paid` (G). Each row shows its
    action — *fill*, *append (NPI-matched)*, *practitioner mismatch*,
    *ambiguous* or *unassigned* — alongside the EOB's NPI, which is what decides
    whether a session may be appended. Ana and Oxana take appends for visits
@@ -600,8 +707,13 @@ BAA-covered**, so processing real PHI there is itself a gap — see
 - **Tuned for the Noridian RA layout.** A different payer's remittance format
   will not parse. The extraction rules assume six dollar amounts per service
   line, in the documented order.
-- **Only the `2026 Medicare` sheet is read or written.** The sheet name is a
-  constant and will need updating for a new plan year.
+- **Only `2026 Medicare` and `2026 Medical` are read or written.** The names are
+  constants and will need updating for a new plan year. Every other sheet in the
+  workbook is preserved untouched.
+- **A crossover can only attach to a 2026 row.** An HPSM crossover for a 2025
+  session has no row on either 2026 sheet, so it is flagged rather than
+  recorded. That is by design — the money belongs on the sheet holding the
+  original visit — but it means the flagged list is long on a first run.
 - **Name truncation vs. typos.** A name that is a strict prefix of another is
   treated as a confident match, because that is exactly how Medicare truncates.
   A dropped trailing character therefore reads as truncation rather than as a

@@ -18,6 +18,8 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
+from remit.config import MEDICAL_SHEET_NAME
+
 from .fixtures.synthetic_employees_data import (
     ANA_HEADERS,
     ANA_ROWS,
@@ -27,6 +29,7 @@ from .fixtures.synthetic_employees_data import (
     OXANA_ROWS,
     OXANA_TITLE,
 )
+from .fixtures.synthetic_db_data import EMPLOYEE_SEED
 from .fixtures.synthetic_remit_data import MUTUAL_ROWS, SCHEDULE_ONLY_PATIENT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "List_of_Patients_Schedule.xlsx"
@@ -82,9 +85,25 @@ ROWS = [
     ["Bystritskaya Jr, Anna", "Medicare", datetime(2026, 4, 14), "2/32/26",
      None, None, None, None, None, None, "99213/90833"],
 
+    # --- 835 source: a Medicare row to fill, whose `Co-pays Paid` the HPSM
+    # --- crossover for the same session then settles ------------------------
+    ["Ashgrove, Petra", "Medicare", datetime(2026, 7, 6), "2/32/26",
+     None, None, None, None, None, DX, "99213/90833"],
+
     # --- Date present in the sheet but not in the remit ---------------------
     [SCHEDULE_ONLY_PATIENT["schedule_name"], "Medicare", datetime(2026, 1, 5), "2/32/26",
      None, None, None, None, None, DX, "99213/90833"],
+]
+
+
+#: Rows seeded on `2026 Medical`, the HPSM sheet. `Bellweather, Colm` has a
+#: blank Payment so the HPSM primary fill has somewhere to land.
+MEDICAL_ROWS = [
+    ["Bellweather, Colm", "San Mateo", datetime(2026, 7, 8), "2/32/26",
+     None, None, None, None, None, DX, "90834"],
+    # Already recorded, so a re-run must leave it alone.
+    ["Bellweather, Colm", "San Mateo", datetime(2026, 6, 10), "2/32/26",
+     104.27, 26.60, None, None, None, DX, "90834"],
 ]
 
 
@@ -111,8 +130,24 @@ def build() -> Workbook:
             if index in (5, 6):
                 cell.number_format = "0.00"
 
-    # A second sheet that must come back byte-for-byte intact.
-    other = workbook.create_sheet("2026 Medical")
+    # `2026 Medical` is the HPSM half of the schedule: same column layout,
+    # same header row, resolved independently by header text.
+    medical = workbook.create_sheet(MEDICAL_SHEET_NAME)
+    medical.cell(row=1, column=1, value=2026).font = Font(bold=True, size=14)
+    for index, header in enumerate(HEADERS, start=1):
+        cell = medical.cell(row=2, column=index, value=header)
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+    for offset, values in enumerate(MEDICAL_ROWS):
+        for index, value in enumerate(values, start=1):
+            cell = medical.cell(row=3 + offset, column=index, value=value)
+            if index in (3, 4) and isinstance(value, datetime):
+                cell.number_format = "mm/dd/yyyy"
+            if index in (5, 6, 7):
+                cell.number_format = "0.00"
+
+    # A sheet that is not part of the schedule and must come back intact.
+    other = workbook.create_sheet("2026 Dental")
     other["A1"] = "Untouched sheet"
     other["A2"] = "Patient"
     other["B2"] = "Note"
@@ -167,13 +202,22 @@ def _write_employee_sheet(sheet, headers, rows, header_row: int) -> None:
             cell.number_format = "0.00"
 
 
+def _employee_seed_rows(name, rows):
+    """Append the 835 fixture's seed row to the tab it belongs to."""
+    tab, patient, session = EMPLOYEE_SEED
+    if name != tab:
+        return rows
+    return list(rows) + [(patient, session, {})]
+
+
 def build_employees() -> Workbook:
     """The synthetic `AMSMC_employees.xlsx`: three tabs, two header layouts."""
     workbook = Workbook()
 
     ana = workbook.active
     ana.title = "Ana"
-    _write_employee_sheet(ana, ANA_HEADERS, ANA_ROWS, header_row=1)
+    _write_employee_sheet(ana, ANA_HEADERS,
+                          _employee_seed_rows("Ana", ANA_ROWS), header_row=1)
 
     marcia = workbook.create_sheet("Marcia")
     _write_employee_sheet(marcia, MARCIA_HEADERS, MARCIA_ROWS, header_row=1)

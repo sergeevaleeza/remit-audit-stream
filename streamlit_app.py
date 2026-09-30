@@ -17,6 +17,9 @@ import streamlit as st
 
 from remit.config import (
     ACTION_FILL,
+    DB_INGEST_ENABLED,
+    PDF_INGEST_ENABLED,
+    looks_like_hosted_runtime,
     EMPLOYEE_APPEND_SHEETS,
     EMPLOYEE_NPI,
     EMPLOYEE_SHEETS,
@@ -31,15 +34,15 @@ from remit.config import (
     NPI_TO_DOCTOR,
     SHEET_NAME,
 )
+from remit.db_source import RemitDbError, load_visits_from_bytes
 from remit.excel_updater import (
     ScheduleError,
     annotate_placement,
     build_updated_workbook,
     download_filename,
-    get_schedule_sheet,
     load_schedule_workbook,
-    read_schedule_rows,
-    resolve_columns,
+    read_all_schedule_rows,
+    schedule_sheets,
 )
 from remit.matching import build_plan, find_legacy_duplicate_rows, summarize
 from remit.employees import (
@@ -52,6 +55,7 @@ from remit.employees import (
     read_sheets,
     summarize_employees,
 )
+from remit.db_source import aggregate_by_payer
 from remit.mutual import load_dx_lookup
 from remit.pdf_parser import cutoff_label, parse_remittances, split_by_eob_cutoff
 
@@ -76,7 +80,7 @@ def clear_session() -> None:
         del st.session_state[key]
 
 
-def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]],
+def upload_signature(schedule_bytes: bytes, source_payloads: list[tuple[bytes, str]],
                      mutual_bytes: bytes | None,
                      employees_bytes: bytes | None = None,
                      cutoff: date | None = None) -> str:
@@ -86,7 +90,7 @@ def upload_signature(schedule_bytes: bytes, pdf_payloads: list[tuple[bytes, str]
     sees, so the plan has to be rebuilt even though the uploads are the same.
     """
     digest = hashlib.sha256(schedule_bytes)
-    for payload, name in pdf_payloads:
+    for payload, name in source_payloads:
         digest.update(name.encode("utf-8"))
         digest.update(payload)
     if mutual_bytes:
@@ -141,6 +145,8 @@ def render_summary(counts: dict[str, int], cutoff: date | None = None,
         f"**{counts['update']}** updated (adjusted EOB) · "
         f"**{counts['skip']}** skipped (already recorded) · "
         f"**{counts['review']}** need review"
+        + (f" · **{counts['crossover_orphan']}** crossover(s) with no Medicare visit"
+           if counts.get("crossover_orphan") else "")
     )
     # The scope of the run belongs next to its counts: "12 visits parsed" means
     # something different when a remit was left out of the run entirely.
@@ -353,9 +359,31 @@ with left:
         "1 · Patient schedule (.xlsx)", type=["xlsx"], accept_multiple_files=False
     )
 with middle:
-    pdf_uploads = st.file_uploader(
-        "2 · Medicare remittance PDFs", type=["pdf"], accept_multiple_files=True
-    )
+    hosted = looks_like_hosted_runtime()
+    db_upload = None
+    pdf_uploads = []
+    if DB_INGEST_ENABLED and hosted:
+        st.error(
+            "2 · 835 database — **unavailable on a hosted deployment.** The "
+            "database holds Medicare and HPSM PHI and is local-only. Run the "
+            "app on the clinic's own machine."
+        )
+    elif DB_INGEST_ENABLED:
+        db_upload = st.file_uploader(
+            "2 · 835 remittance database (.sqlite)", type=["sqlite", "sqlite3", "db"],
+            accept_multiple_files=False,
+            help="remittance_data.sqlite from remits-extractor. Read-only and "
+                 "in-memory: nothing is written back to it. Noridian "
+                 "(Medicare) and Health Plan of San Mateo only — other payers "
+                 "in the file are ignored.",
+        )
+    if PDF_INGEST_ENABLED:
+        pdf_uploads = st.file_uploader(
+            "2 · Medicare remittance PDFs", type=["pdf"], accept_multiple_files=True,
+            help="The legacy PDF path, enabled because REMIT_SOURCE_SCOPE=pdf. "
+                 "Never run this together with the 835 database — the same "
+                 "visits would be counted twice.",
+        )
 with right:
     mutual_upload = st.file_uploader(
         "3 · DX reference (optional)", type=["xlsx"], accept_multiple_files=False,
@@ -389,16 +417,26 @@ st.caption(
     "session is either kept whole or skipped whole."
 )
 
-if not schedule_upload or not pdf_uploads:
-    st.info("Upload the schedule workbook and at least one remittance PDF to begin.")
+if DB_INGEST_ENABLED:
+    source_ready = db_upload is not None
+    source_prompt = "the 835 remittance database (.sqlite)"
+else:
+    source_ready = bool(pdf_uploads)
+    source_prompt = "at least one remittance PDF"
+
+if not schedule_upload or not source_ready:
+    st.info(f"Upload the schedule workbook and {source_prompt} to begin.")
     st.stop()
 
 schedule_bytes = schedule_upload.getvalue()
-pdf_payloads = [(upload.getvalue(), upload.name) for upload in pdf_uploads]
+if DB_INGEST_ENABLED:
+    source_payloads = [(db_upload.getvalue(), db_upload.name)]
+else:
+    source_payloads = [(upload.getvalue(), upload.name) for upload in pdf_uploads]
 mutual_bytes = mutual_upload.getvalue() if mutual_upload else None
 employees_bytes = employees_upload.getvalue() if employees_upload else None
 signature = upload_signature(
-    schedule_bytes, pdf_payloads, mutual_bytes, employees_bytes, cutoff
+    schedule_bytes, source_payloads, mutual_bytes, employees_bytes, cutoff
 )
 
 
@@ -407,9 +445,7 @@ signature = upload_signature(
 if st.session_state.get("signature") != signature:
     try:
         workbook = load_schedule_workbook(schedule_bytes)
-        worksheet = get_schedule_sheet(workbook)
-        columns = resolve_columns(worksheet)
-        rows = read_schedule_rows(worksheet, columns)
+        rows, sheet_columns = read_all_schedule_rows(workbook)
     except ScheduleError as error:
         st.error(str(error))
         st.stop()
@@ -417,21 +453,40 @@ if st.session_state.get("signature") != signature:
         safe_error("Could not read the workbook", error)
         st.stop()
 
-    with st.spinner("Parsing remittance PDFs…"):
-        try:
-            # Whole remits dated before the cutoff are excluded here, before
-            # aggregation, so a skipped one contributes neither visits nor a
-            # reconciliation occurrence. One filter, ahead of both consumers,
-            # so the schedule and the employees file cannot disagree on scope.
-            documents, visits = parse_remittances(
-                [(io.BytesIO(payload), name) for payload, name in pdf_payloads],
-                eob_cutoff=cutoff,
-            )
-        except Exception as error:  # noqa: BLE001
-            safe_error("Could not parse the PDFs", error)
-            st.stop()
+    db_report = None
+    if DB_INGEST_ENABLED:
+        with st.spinner("Reading the 835 database…"):
+            try:
+                documents, _all_visits, db_report = load_visits_from_bytes(
+                    source_payloads[0][0]
+                )
+            except RemitDbError as error:
+                st.error(str(error))
+                st.stop()
+            except Exception as error:  # noqa: BLE001
+                safe_error("Could not read the 835 database", error)
+                st.stop()
+        # The cutoff is applied to each remit's `payment_date`, which is what
+        # `billed_date` carries for a database-sourced remit.
+        processed_docs, skipped_docs = split_by_eob_cutoff(documents, cutoff)
+        visits = aggregate_by_payer(processed_docs)
+    else:
+        with st.spinner("Parsing remittance PDFs…"):
+            try:
+                # Whole remits dated before the cutoff are excluded here,
+                # before aggregation, so a skipped one contributes neither
+                # visits nor a reconciliation occurrence. One filter, ahead of
+                # both consumers, so the schedule and the employees file
+                # cannot disagree on scope.
+                documents, visits = parse_remittances(
+                    [(io.BytesIO(payload), name) for payload, name in source_payloads],
+                    eob_cutoff=cutoff,
+                )
+            except Exception as error:  # noqa: BLE001
+                safe_error("Could not parse the PDFs", error)
+                st.stop()
+        processed_docs, skipped_docs = split_by_eob_cutoff(documents, cutoff)
 
-    processed_docs, skipped_docs = split_by_eob_cutoff(documents, cutoff)
     undated = [doc for doc in processed_docs if doc.billed_date is None]
 
     dx_lookup = None
@@ -448,8 +503,11 @@ if st.session_state.get("signature") != signature:
     plan = build_plan(visits, rows, dx_lookup)
     # Flag any anchor that would be unsafe to insert under, so the preview can
     # say the row will be appended instead. apply_changes re-checks this
-    # independently, so correctness never depends on this annotation.
-    annotate_placement(worksheet, columns, plan)
+    # independently, so correctness never depends on this annotation. Done per
+    # sheet, because an anchor only means anything on its own sheet.
+    for _name, _worksheet in schedule_sheets(workbook).items():
+        annotate_placement(_worksheet, sheet_columns[_name],
+                           [c for c in plan if c.sheet == _name])
 
     employee_sheets = None
     employee_changes: list = []
@@ -477,6 +535,8 @@ if st.session_state.get("signature") != signature:
         skipped_remits=[(d.filename, d.check_eft) for d in skipped_docs],
         processed_remits=[d.filename for d in processed_docs],
         undated_remits=[d.filename for d in undated],
+        db_report=db_report,
+        sheets_present=list(sheet_columns),
         schedule_row_count=len(rows),
         schedule_rows=rows,
         dx_entry_count=len(dx_lookup) if dx_lookup else 0,
@@ -501,6 +561,23 @@ st.success(
     + (f" DX reference loaded: {dx_entry_count} patient(s)." if dx_entry_count
        else " No DX reference uploaded — DX will be left blank.")
 )
+
+db_report = st.session_state.get("db_report")
+if db_report is not None:
+    payers = " · ".join(f"{name}: {count:,} line(s)"
+                        for name, count in sorted(db_report.payer_rows.items()))
+    st.caption(
+        f"835 database: **{db_report.used_rows:,}** in-scope service line(s) "
+        f"across **{db_report.remits}** remittance(s) — {payers}. Payers outside "
+        "Noridian and Health Plan of San Mateo are filtered out. Read-only: "
+        "nothing is written back to the database."
+    )
+    if db_report.skipped_no_date or db_report.skipped_no_npi:
+        st.warning(
+            f"{db_report.skipped_no_date} line(s) had no usable service date and "
+            f"{db_report.skipped_no_npi} had no rendering provider NPI, so they "
+            "could not be placed. They are not in this run."
+        )
 
 if skipped_remits:
     listed = ", ".join(

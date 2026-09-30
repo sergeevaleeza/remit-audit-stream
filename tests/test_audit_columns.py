@@ -209,4 +209,4 @@ def test_audit_columns_do_not_break_idempotency(schedule_bytes, visits, schedule
 def test_other_sheets_still_survive(applied, schedule_bytes):
     workbook = load_schedule_workbook(schedule_bytes)
     plan_workbook = openpyxl.load_workbook(io.BytesIO(schedule_bytes))
-    assert plan_workbook.sheetnames == workbook.sheetnames == ["2026 Medicare", "2026 Medical"]
+    assert plan_workbook.sheetnames == workbook.sheetnames == ["2026 Medicare", "2026 Medical", "2026 Dental"]

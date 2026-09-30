@@ -12,8 +12,13 @@ from pathlib import Path
 
 # --- Workbook layout -------------------------------------------------------
 
-#: The only sheet the app is ever allowed to touch.
+#: The two schedule sheets the app is allowed to touch. Both carry the same
+#: column layout with headers on row 2; which one a *new* visit lands on is
+#: decided by its payer, while an *existing* row is filled wherever staff
+#: already filed it (see PAYER_SHEET).
 SHEET_NAME = "2026 Medicare"
+MEDICAL_SHEET_NAME = "2026 Medical"
+SCHEDULE_SHEETS = (SHEET_NAME, MEDICAL_SHEET_NAME)
 
 #: Row 1 is a title row (contains "2026"); row 2 holds the headers.
 HEADER_ROW = 2
@@ -54,11 +59,19 @@ REQUIRED_COLUMNS = (
 
 ALL_COLUMNS = REQUIRED_COLUMNS + (COL_COPAYS_PAID, COL_OFFICE, COL_DX) + AUDIT_COLUMNS
 
-#: Cells this app is ever permitted to write on an existing row.
+#: Cells a plain fill may write on an existing row, from the visit's own
+#: amounts. `Co-pays Paid` is deliberately NOT here: it is not sourced from the
+#: visit being matched but from a *different* payer's crossover line, so the
+#: crossover path adds it explicitly rather than every fill proposing it.
 FILLABLE_COLUMNS = (COL_BILLED, COL_PAYMENT, COL_COPAY, COL_COMMENT)
 
 #: Columns that are never touched under any circumstance.
-NEVER_TOUCH_COLUMNS = (COL_COPAYS_PAID, COL_OFFICE)
+#:
+#: `Co-pays Paid` left this list with the 835 source: an HPSM crossover paying
+#: a Medicare visit's coinsurance is exactly what that column records, and it
+#: is the only thing ever written there. Never-overwrite still applies, so a
+#: figure staff already entered is left alone.
+NEVER_TOUCH_COLUMNS = (COL_OFFICE,)
 
 # --- Value formats ---------------------------------------------------------
 
@@ -69,6 +82,9 @@ DATE_FMT = "%m/%d/%Y"
 #: Default `Ins` value: an ordinary in-office Medicare encounter.
 INSURANCE_VALUE = "Medicare"
 
+#: `Ins` value on the `2026 Medical` tab: an HPSM (San Mateo) encounter.
+MEDICAL_INSURANCE_VALUE = "San Mateo"
+
 #: `Ins` value for a telehealth encounter -- POS 10 (patient's home) billed
 #: with the 95 modifier. Derived per visit by `pdf_parser.insurance_label`.
 TELEHEALTH_INSURANCE_LABEL = "POS 10(95)"
@@ -77,6 +93,69 @@ TELEHEALTH_INSURANCE_LABEL = "POS 10(95)"
 #: left alone and merely flagged when the EOB says telehealth. Set True to
 #: rewrite those specific `Ins` cells to the telehealth label instead.
 OVERWRITE_INS_FOR_TELEHEALTH = False
+
+# --- Remittance source ------------------------------------------------------
+#
+# Payments come from the structured 835 database built by `remits-extractor`
+# (`remittance_data.sqlite`), not from parsing remittance PDFs. The PDF parser
+# is deliberately KEPT -- the reconciliation, matching and writing layers the
+# database now feeds are the same ones it fed -- but its ingestion entry point
+# is gated off, because running PDF and database Medicare ingestion together
+# would double-count every visit.
+
+#: `db` -- the 835 database is the only source (the locked default).
+#: `pdf` -- re-enable PDF ingestion instead, for a one-off paper remit.
+DB_SOURCE_SCOPE = os.environ.get("REMIT_SOURCE_SCOPE", "db")
+
+#: Whether the PDF uploader is offered at all. Never both at once.
+PDF_INGEST_ENABLED = DB_SOURCE_SCOPE == "pdf"
+DB_INGEST_ENABLED = DB_SOURCE_SCOPE == "db"
+
+#: The 835 database is PHI for two payers and must stay on the clinic's own
+#: machine, so the uploader is refused on a hosted runtime unless an operator
+#: explicitly overrides it. Streamlit Community Cloud runs apps out of
+#: `/mount/src`, which is the most reliable marker available.
+def looks_like_hosted_runtime() -> bool:
+    if os.environ.get("REMIT_ALLOW_REMOTE_DB") == "1":
+        return False
+    if Path("/mount/src").exists():
+        return True
+    return bool(os.environ.get("STREAMLIT_SERVER_HEADLESS")
+                and os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud")
+
+
+#: Table holding one row per 835 service line, already flattened by the
+#: extractor. Its amount columns are TEXT and must be cast.
+DB_TABLE = "master_remittance_records"
+DB_ROW_LEVEL = "service_line"
+
+#: Payers in scope. Anything else in the database -- Carelon today -- is
+#: filtered out rather than guessed at.
+PAYER_MEDICARE = "NORIDIAN HEALTHCARE SOLUTIONS, LLC"
+PAYER_HPSM = "HEALTH PLAN OF SAN MATEO"
+PAYERS_IN_SCOPE = (PAYER_MEDICARE, PAYER_HPSM)
+
+#: `claim_filing_indicator_code` for each payer, as a cross-check.
+CLAIM_FILING_MEDICARE = "MB"
+CLAIM_FILING_HPSM = "HM"
+
+#: Which schedule sheet a payer's brand-new visits are appended to. Existing
+#: rows are filled wherever staff already filed them, on either sheet.
+PAYER_SHEET = {
+    PAYER_MEDICARE: SHEET_NAME,
+    PAYER_HPSM: MEDICAL_SHEET_NAME,
+}
+
+#: Default `Ins` for a payer's appended rows, before the telehealth override.
+PAYER_INSURANCE = {
+    PAYER_MEDICARE: INSURANCE_VALUE,
+    PAYER_HPSM: MEDICAL_INSURANCE_VALUE,
+}
+
+#: CARC 23 -- "impact of prior payer adjudication". On an HPSM line it marks a
+#: Medicare crossover: HPSM is paying as secondary, so its payment belongs in
+#: the Medicare row's `Co-pays Paid`, not in a new Medical row.
+CROSSOVER_REASON_CODE = "23"
 
 # --- Provider mapping -------------------------------------------------------
 #
@@ -164,6 +243,11 @@ ACTION_SKIP = "Skip (already paid)"
 ACTION_NEW = "New row"
 ACTION_REVIEW = "Needs review"
 
+#: An HPSM crossover line whose Medicare visit is nowhere in the schedule.
+#: Never guessed onto a tab -- the whole point of a crossover is that it pays
+#: an existing Medicare visit, so if that visit is missing something is wrong.
+ACTION_CROSSOVER_ORPHAN = "Crossover, no Medicare visit found - verify"
+
 #: A later remit restated a visit that is already recorded with different
 #: amounts. Distinct from a fill (the cell was blank) and from a skip (the
 #: values agree), because applying it overwrites a recorded value.
@@ -209,6 +293,15 @@ EMPLOYEE_PAYMENT_COLUMN = {
     "Ana": "Paid by Ins toAna",
     "Oxana": "Paid by Insurance",
     "Marcia": "Paid by Insurance",
+}
+
+#: Where each provider's share of an HPSM crossover copay goes. Resolved by
+#: header text like every other employee column; the letters in the real
+#: workbook are Ana I, Marcia G, Oxana G.
+EMPLOYEE_COPAY_COLUMN = {
+    "Ana": "Co-pay to Ana",
+    "Marcia": "Co-payment Paid",
+    "Oxana": "Co-payment Paid",
 }
 
 #: The patient-name header differs on Oxana's sheet.

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Sequence
 from rapidfuzz import fuzz
 
 from .config import (
+    ACTION_CROSSOVER_ORPHAN,
     ACTION_FILL,
     ACTION_NEW,
     ACTION_REVIEW,
@@ -32,6 +33,7 @@ from .config import (
     COL_CHECK_EFT,
     COL_COMMENT,
     COL_COPAY,
+    COL_COPAYS_PAID,
     COL_DX,
     COL_PAYMENT,
     COL_PROCESSED_ON,
@@ -46,9 +48,12 @@ from .config import (
     NAME_AUTO_MATCH_SCORE,
     NAME_REVIEW_MIN_SCORE,
     OVERWRITE_INS_FOR_TELEHEALTH,
+    PAYER_HPSM,
+    PAYER_SHEET,
     REPROCESS_FLAG_ONLY,
     REPROCESS_POLICY,
     REPROCESS_SUM,
+    SHEET_NAME,
 )
 from .pdf_parser import Visit, order_cpt_codes
 
@@ -291,11 +296,18 @@ class ScheduleRow:
 
     row_num: int
     patient: Any = None
+    #: Which schedule sheet this row lives on. Both sheets share a layout, and
+    #: staff decide which one a visit is filed on, so a fill has to write back
+    #: to wherever the row actually is.
+    sheet: str = SHEET_NAME
     ins: Any = None
     data: Any = None
     billed: Any = None
     payment: Any = None
     copay: Any = None
+    #: What the practice has already recorded as collected. Written only by an
+    #: HPSM crossover, and never over a value staff entered themselves.
+    copays_paid: Any = None
     comment: Any = None
     dx: Any = None
     cpt: Any = None
@@ -328,6 +340,9 @@ class Change:
 
     visit: Visit
     action: str
+    #: The sheet this change writes to: the matched row's own sheet for a fill,
+    #: or the payer's sheet for a brand-new row.
+    sheet: str = SHEET_NAME
     row_num: int | None = None
     fills: dict[str, Any] = field(default_factory=dict)
     existing_billed: Any = None
@@ -371,7 +386,7 @@ class Change:
 
     @property
     def needs_review(self) -> bool:
-        return self.action == ACTION_REVIEW
+        return self.action in (ACTION_REVIEW, ACTION_CROSSOVER_ORPHAN)
 
     @property
     def inserts_under_patient(self) -> bool:
@@ -710,7 +725,8 @@ def telehealth_flag(visit: Visit, row: ScheduleRow) -> tuple[str, str]:
 
 
 def find_patient_anchor(visit: Visit,
-                        rows: Sequence[ScheduleRow]) -> tuple[int | None, str | None]:
+                        rows: Sequence[ScheduleRow],
+                        sheet: str | None = None) -> tuple[int | None, str | None]:
     """The last existing row belonging to this visit's patient, if any.
 
     A new row for a patient who is already in the schedule is inserted
@@ -724,6 +740,8 @@ def find_patient_anchor(visit: Visit,
     for row in rows:
         if is_blank(row.patient):
             continue
+        if sheet is not None and row.sheet != sheet:
+            continue  # a row on the other sheet is no anchor for this one
         if name_score(visit.patient, str(row.patient)) < NAME_AUTO_MATCH_SCORE:
             continue
         if anchor_row is None or row.row_num > anchor_row:
@@ -753,6 +771,64 @@ def _dx_for(visit: Visit, dx_lookup: "DxLookup | None") -> tuple[str | None, str
     return match.dx, match.status, "", None
 
 
+def plan_crossover(visit: Visit, rows: Sequence[ScheduleRow],
+                   audit: dict[str, Any]) -> Change:
+    """An HPSM secondary payment on a visit Medicare already adjudicated.
+
+    CARC 23 means HPSM is settling what Medicare left to the patient, so the
+    money is that Medicare visit's coinsurance being paid -- not a new visit.
+    It goes into the Medicare row's `Co-pays Paid` and touches nothing else:
+    not `Payment`, not `Co-pay`, not `Ins`.
+
+    If no Medicare row exists for the patient and date, the crossover has
+    nothing to attach to. That is reported rather than guessed at -- inventing
+    a row, or dropping the payment onto the Medical sheet as though HPSM were
+    primary, would both be wrong.
+    """
+    candidates = [
+        (row, name_score(visit.patient, str(row.patient)))
+        for row in rows
+        if row.sheet == SHEET_NAME
+        and not is_blank(row.patient)
+        and row.data_date == visit.service_date
+    ]
+    candidates = [pair for pair in candidates if pair[1] >= NAME_AUTO_MATCH_SCORE]
+    candidates.sort(key=lambda pair: pair[1], reverse=True)
+
+    audit = dict(audit)
+    audit["sheet"] = SHEET_NAME
+
+    if not candidates:
+        return Change(
+            visit=visit,
+            action=ACTION_CROSSOVER_ORPHAN,
+            score=None,
+            review_reasons=[
+                f"HPSM crossover of {_money(visit.payment)} for "
+                f"{visit.data_str}, but no matching visit is on "
+                f"`{SHEET_NAME}`. Medicare should have paid it first - find "
+                "that visit before recording the secondary payment."
+            ],
+            accepted=False,
+            **audit,
+        )
+
+    row, score = candidates[0]
+    audit["sheet"] = row.sheet
+    already = not is_blank(row.copays_paid)
+    return Change(
+        visit=visit,
+        action=ACTION_SKIP if already else ACTION_FILL,
+        row_num=row.row_num,
+        fills={} if already else {COL_COPAYS_PAID: visit.payment},
+        existing_billed=row.billed,
+        score=score,
+        review_reasons=[],
+        accepted=not already,
+        **audit,
+    )
+
+
 def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
                 dx_lookup: "DxLookup | None" = None,
                 today: date | None = None) -> Change:
@@ -773,6 +849,16 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
     if dx_reason:
         review_reasons.append(dx_reason)
 
+    # An HPSM crossover is a second payer settling an existing Medicare visit,
+    # not a visit of its own, so it never follows the ordinary new-row path.
+    if visit.crossover and visit.payer == PAYER_HPSM:
+        return plan_crossover(visit, rows, dict(
+            dx_value=dx_value, dx_status=dx_status, dx_note=dx_note,
+            processed_on=(today or date.today()).strftime(DATE_FMT),
+            check_eft_display=CHECK_EFT_JOINER.join(sorted(visit.check_efts)),
+            duplicate_note=visit.duplicate_note,
+        ))
+
     # An OA-18 exact duplicate is adjudicated at $0 because the original
     # already paid. If every occurrence was a duplicate, the paying remit was
     # never uploaded, so there is no real amount to record.
@@ -781,9 +867,14 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
 
 
 
-    anchor_row, anchor_patient = find_patient_anchor(visit, rows)
+    # A brand-new visit lands on its payer's sheet; a matched one is filled
+    # wherever staff already filed it, so `sheet` is overridden below once a
+    # row is chosen.
+    target_sheet = PAYER_SHEET.get(visit.payer, SHEET_NAME)
+    anchor_row, anchor_patient = find_patient_anchor(visit, rows, target_sheet)
 
     audit = dict(
+        sheet=target_sheet,
         dx_value=dx_value,
         dx_status=dx_status,
         dx_note=dx_note,
@@ -817,6 +908,7 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
         # Fills are computed against the row shown in the preview, so ticking an
         # ambiguous item has a visible effect rather than silently doing nothing.
         top_row = candidates[0][0]
+        audit["sheet"] = top_row.sheet
         return Change(
             visit=visit,
             action=ACTION_REVIEW,
@@ -830,6 +922,7 @@ def plan_change(visit: Visit, rows: Sequence[ScheduleRow],
         )
 
     row, score = chosen
+    audit["sheet"] = row.sheet
 
     telehealth_message, ins_update = telehealth_flag(visit, row)
     audit["telehealth_mismatch"] = telehealth_message
@@ -950,6 +1043,9 @@ def summarize(changes: Sequence[Change]) -> dict[str, int]:
         "skip": sum(1 for c in changes if c.action == ACTION_SKIP),
         "update": sum(1 for c in changes if c.action == ACTION_UPDATE),
         "review": sum(1 for c in changes if c.action == ACTION_REVIEW),
+        "crossover_orphan": sum(
+            1 for c in changes if c.action == ACTION_CROSSOVER_ORPHAN
+        ),
     }
 
 

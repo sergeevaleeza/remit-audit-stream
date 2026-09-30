@@ -332,8 +332,8 @@ def test_other_sheets_and_formulas_survive(schedule_bytes, plan):
     updated, _ = build_updated_workbook(schedule_bytes, plan)
     workbook = load_schedule_workbook(updated.getvalue())
 
-    assert workbook.sheetnames == ["2026 Medicare", "2026 Medical"]
-    other = workbook["2026 Medical"]
+    assert workbook.sheetnames == ["2026 Medicare", "2026 Medical", "2026 Dental"]
+    other = workbook["2026 Dental"]
     assert other["A1"].value == "Untouched sheet"
     assert other["A3"].value == "Example, Patient"
     assert other["C3"].value == "=1+1"

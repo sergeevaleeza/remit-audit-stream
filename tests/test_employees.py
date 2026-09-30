@@ -348,8 +348,8 @@ def test_mismatched_row_is_not_filled(employees_bytes, emp_changes):
 def test_appended_rows_inherit_styling(employees_bytes, emp_changes):
     updated, _ = build_updated_employees(employees_bytes, emp_changes)
     worksheet = load_employees_workbook(updated.getvalue())["Ana"]
-    # Ana's tab has six seeded rows (2-7); the append lands on row 8.
-    template, appended = 7, 8
+    # Ana's tab has seven seeded rows (2-8); the append lands on row 9.
+    template, appended = 8, 9
     assert worksheet.cell(row=appended, column=1).value == "Ravensworth, Cecily"
     for column in (1, 2, 8):
         assert (worksheet.cell(row=appended, column=column).number_format
