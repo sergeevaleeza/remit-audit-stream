@@ -20,6 +20,44 @@ SCHEDULE_XLSX = FIXTURES / "List_of_Patients_Schedule.xlsx"
 EMPLOYEES_XLSX = FIXTURES / "AMSMC_employees_sample.xlsx"
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _synthetic_provider_map():
+    """Pin the provider map to the repo's synthetic one for the whole suite.
+
+    `NPI_TO_DOCTOR` resolves from `npi_map.local.json` or Streamlit secrets when
+    either is present, so on the clinic's own machine the real map would load
+    and every synthetic fixture NPI would read as an unknown provider -- turning
+    most of the suite into "Needs review". The tests must assert the app's
+    behaviour, not whichever map the operator happens to have configured.
+    """
+    from remit import config, employees, pdf_parser
+
+    synthetic = dict(config._SYNTHETIC_NPI_TO_DOCTOR)
+    employee_npi = {
+        tab: npi for npi, name in synthetic.items()
+        for tab in config.EMPLOYEE_SHEETS
+        if config._npi_key(name) == config._npi_key(tab)
+    }
+    appends = tuple(n for n in config.EMPLOYEE_SHEETS if n in employee_npi)
+
+    saved = []
+    for module, name, value in (
+        (config, "NPI_TO_DOCTOR", synthetic),
+        (pdf_parser, "NPI_TO_DOCTOR", synthetic),
+        (config, "EMPLOYEE_NPI", employee_npi),
+        (employees, "EMPLOYEE_NPI", employee_npi),
+        (config, "EMPLOYEE_APPEND_SHEETS", appends),
+        (employees, "EMPLOYEE_APPEND_SHEETS", appends),
+    ):
+        saved.append((module, name, getattr(module, name)))
+        setattr(module, name, value)
+    try:
+        yield
+    finally:
+        for module, name, value in saved:
+            setattr(module, name, value)
+
+
 @pytest.fixture(scope="session")
 def remit_parse():
     """(documents, visits) parsed once from the sample remittance."""

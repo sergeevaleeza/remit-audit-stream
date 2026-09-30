@@ -484,27 +484,94 @@ unchanged.
 
 ---
 
-## Run locally
+## Running locally
 
-Requires Python 3.11+.
+This app handles PHI (patient schedules, remittance PDFs, and the 835 database).
+**Run it on the clinic's own machine for any real data.** The hosted Streamlit
+Community Cloud deployment is for testing with synthetic data only — the **835
+database upload is disabled there on purpose**, because Community Cloud is not a
+HIPAA/BAA-covered host and the database holds Medicare + HPSM PHI. Run locally
+and that data never leaves your computer: it is read into memory, used for the
+session, and gone when you close the tab.
 
-```bash
-git clone <your-repo-url>
-cd remit-audit-stream
+### Prerequisites
 
+- Python 3.11 or newer ([python.org](https://www.python.org/downloads/) — on
+  Windows, tick **"Add python.exe to PATH"** during install).
+- The `remit-audit-stream` repository on your machine.
+
+### Start the app
+
+**Windows — just double-click [`run.bat`](run.bat).** It creates the virtual
+environment and installs dependencies the first time, then starts the app on
+every later run. No terminal needed.
+
+To do it by hand instead, open a terminal in the repo folder and run:
+
+**Windows (PowerShell):**
+```powershell
+cd C:\path\to\remit-audit-stream
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-
+.venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Run the tests with:
+**macOS / Linux:**
+```bash
+cd /path/to/remit-audit-stream
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+It opens automatically at **http://localhost:8501**. On this local run the **835
+database (`.sqlite`) slot is enabled** — drop the file in like any other upload.
+(The first launch installs dependencies and may take a minute; later launches
+just need the last two commands after `activate`.)
+
+### One-time setup: the provider map
+
+The real NPI → provider mapping is **not** stored in the repo. Create
+`.streamlit/secrets.toml` in the repo folder (this file is gitignored, so it
+stays local):
+
+```toml
+[npi_to_doctor]
+"1000000001" = "Dr. A"
+"1000000002" = "Provider B"
+"1000000003" = "Provider C"
+```
+
+Replace the placeholders with the clinic's real NPIs and names. Without this
+file, the `Comment` column and the provider-tab routing fall back to
+placeholders.
+
+> **Make the associates' names match their employees-file tab names exactly.**
+> This one table does two jobs: it supplies the `Comment` text *and*, by being
+> inverted, decides which employees tab a session may be appended to. An
+> associate whose value here is `Ana` owns the `Ana` tab; write `Ana R.` or
+> `Dr. Berezovskaya` instead and that tab silently becomes fill-only. The
+> supervising physician's entry should **not** match any tab name — that is
+> what keeps incident-to visits from being attributed to an associate.
+
+### Run the tests
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
+
+### When you're done
+
+Click **Clear all data** in the app, or just close the browser tab and stop the
+terminal process (`Ctrl+C`; with `run.bat`, close its window). Nothing is
+written to disk or logged; downloads you generate are the only saved output.
+
+> Real patient data belongs only on the local machine. If you ever need this at
+> a shareable URL with real data, move it to BAA-covered hosting first — the
+> local setup above is the right home for routine clinic use.
 
 ---
 
@@ -520,6 +587,10 @@ On [Streamlit Community Cloud](https://share.streamlit.io):
 
 Because the app handles PHI, set the app's visibility so only your account (or
 specific invited viewers) can open it, rather than leaving it public.
+
+**A hosted deployment is for synthetic data only.** The 835 database uploader is
+refused there on purpose — Community Cloud is not BAA-covered. See
+[Running locally](#running-locally).
 
 ---
 

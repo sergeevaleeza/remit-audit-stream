@@ -1,6 +1,7 @@
 [server]
-# Remittance PDFs and the workbooks are all comfortably under this.
-maxUploadSize = 50
+# Raised for the 835 database upload: the schedule workbook and the
+# remittance PDFs are small, but the .sqlite is not.
+maxUploadSize = 10000
 
 [browser]
 # No usage telemetry leaves this app.
